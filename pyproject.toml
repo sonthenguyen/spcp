@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spcp"
+version = "0.1.0"
+description = "Stable Principal Component Pursuit: split a matrix into low-rank + sparse outliers + dense noise"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "sonthenguyen" }]
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.21", "scipy>=1.8"]
+keywords = ["robust pca", "stable pcp", "low-rank", "outlier detection", "matrix decomposition"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/sonthenguyen/spcp"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
