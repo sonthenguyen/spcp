@@ -330,3 +330,18 @@ def test_soft_threshold():
     Y = X.copy()
     out = _soft(Y, 1.0, out=Y)
     assert out is Y and np.array_equal(Y, expected)
+
+
+@pytest.mark.parametrize("solver", ["bcd", "apg"])
+@pytest.mark.parametrize("shape", [(120, 80), (40, 300)])
+def test_row_blocks_do_not_change_results(monkeypatch, solver, shape):
+    # tests use small matrices that fit in one block; force many blocks
+    import spcp._stablepcp as sp
+    L0, S0, M = make_data(*shape, r=3)
+    a = StablePCP(sigma=0.1, solver=solver).fit(M)
+    monkeypatch.setattr(sp, "_BLOCK", 7)          # rows of a few entries
+    b = StablePCP(sigma=0.1, solver=solver).fit(M)
+    assert a.n_iter_ == b.n_iter_
+    assert np.allclose(a.L_, b.L_, rtol=0, atol=1e-10)
+    assert np.allclose(a.S_, b.S_, rtol=0, atol=1e-10)
+    assert np.allclose(a.noise_, M - a.L_ - a.S_, atol=1e-10)

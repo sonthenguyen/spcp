@@ -91,7 +91,7 @@ full list.
 - Missing values (NaN) are not supported yet; fill or remove them first.
 - Each iteration costs one eigen-decomposition of the smaller side of M, so
   very large matrices in both dimensions are slow. GPU support is planned.
-- Memory use peaks at roughly 7–11 times the size of M.
+- Memory use peaks at roughly 5–7 times the size of M.
 
 ## Running the tests
 

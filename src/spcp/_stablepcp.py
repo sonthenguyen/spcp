@@ -61,16 +61,39 @@ __all__ = ["StablePCP", "trim_rank"]
 # ----------------------------------------------------------------------------
 # helpers
 # ----------------------------------------------------------------------------
+# Elementwise work is done in row blocks of about this many entries (small
+# enough to stay in CPU cache), so the
+# temporary arrays it needs stay small whatever the size of the matrix.
+_BLOCK = 1 << 16
+
+
+def _row_blocks(X):
+    rows = max(1, _BLOCK // max(1, X.shape[1]))
+    for i in range(0, X.shape[0], rows):
+        yield slice(i, i + rows)
+
+
 def _soft(X, t, out=None):
     """Elementwise soft thresholding: sign(x) * max(|x| - t, 0).
-    Uses one temporary array; out=X overwrites X in place."""
-    mag = np.abs(X)
-    mag -= t
-    np.maximum(mag, 0.0, out=mag)
+    out=X overwrites X in place; temporaries are limited to one row block."""
     if out is None:
-        out = mag
-    np.copysign(mag, X, out=out)
+        out = np.empty_like(X)
+    for sl in _row_blocks(X):
+        x = X[sl]
+        mag = np.abs(x)
+        mag -= t
+        np.maximum(mag, 0.0, out=mag)
+        np.copysign(mag, x, out=out[sl])
     return out
+
+
+def _sqdist(A, B):
+    """||A - B||_F^2 without a full-size temporary."""
+    total = 0.0
+    for sl in _row_blocks(A):
+        d = A[sl] - B[sl]
+        total += float(np.vdot(d, d))
+    return total
 
 
 def _randomized_svd(X, k, n_iter, oversample, rng):
@@ -118,7 +141,10 @@ def _svt_gram(X, thr, cap):
     k = min(k, cap)
     V = V[:, -k:]                               # top-k eigenvectors
     s = np.sqrt(w[-k:])
-    L = (A @ V * (1.0 - thr / s)) @ V.T
+    if k <= A.shape[1] // 2:
+        L = (A @ V * (1.0 - thr / s)) @ V.T     # m x k intermediate (small k)
+    else:
+        L = A @ ((V * (1.0 - thr / s)) @ V.T)   # n x n intermediate only
     return (L if tall else L.T), k
 
 
@@ -381,12 +407,18 @@ class StablePCP:
         self._n_gram = self._n_fallback = 0
 
         normM = max(np.linalg.norm(M), np.finfo(float).tiny)
+        # Arrays kept between steps: M, L, S and one work buffer (plus the
+        # two previous iterates in APG mode). Each step overwrites them in
+        # place; only the new L from the SVT is freshly allocated.
         L = np.zeros_like(M)
         S = np.zeros_like(M)
-        L_prev, S_prev = L, S
+        buf = np.empty_like(M)
+        L_prev = S_prev = None
         t_prev = t = 1.0
         mu = mu_init_s
         mode = "apg" if self.solver == "apg" else "bcd"
+        if mode == "apg":
+            L_prev, S_prev = np.zeros_like(M), np.zeros_like(M)
         self.switched_at_ = None
         self.errors_ = []
         self.converged_ = False
@@ -394,51 +426,53 @@ class StablePCP:
         res_hist = []
         n_floor = 0
 
-        buf = np.empty_like(M)                    # reusable work array
-
-        def sqdist(A, B):
-            np.subtract(A, B, out=buf)
-            return float(np.vdot(buf, buf))
-
         for it in range(1, int(self.max_iter) + 1):
             if mode == "bcd":
                 # exact minimisation over each block in turn
                 np.subtract(M, S, out=buf)
                 L_new, rank = self._svt(buf, mu, randomized, polishing)
-                S_new = np.subtract(M, L_new)
-                _soft(S_new, lam * mu, out=S_new)
+                d2 = _sqdist(L_new, L)
+                L = L_new
+                np.subtract(M, L, out=buf)
+                _soft(buf, lam * mu, out=buf)             # new S
+                d2 += _sqdist(buf, S)
+                S, buf = buf, S
             else:
-                # accelerated proximal gradient (Lin et al. 2009): gradient
-                # step of size 1/2 from the extrapolated point, then prox
+                # accelerated proximal gradient (Lin et al. 2009), in place:
+                # L_prev/S_prev become the extrapolated points Y, then the
+                # gradient points G = Y - R with R = (Y_L + Y_S - M) / 2.
                 beta = (t_prev - 1.0) / t
-                YL = L + beta * (L - L_prev)
-                YS = S + beta * (S - S_prev)
-                R = np.add(YL, YS)
-                R -= M
-                R *= 0.5
-                np.subtract(YL, R, out=buf)
-                L_new, rank = self._svt(buf, mu / 2.0, randomized, polishing)
-                np.subtract(YS, R, out=R)
-                S_new = _soft(R, lam * mu / 2.0, out=R)
-                del R
+                for sl in _row_blocks(M):
+                    L_prev[sl] *= -beta
+                    L_prev[sl] += (1.0 + beta) * L[sl]
+                    S_prev[sl] *= -beta
+                    S_prev[sl] += (1.0 + beta) * S[sl]
+                    np.add(L_prev[sl], S_prev[sl], out=buf[sl])
+                    buf[sl] -= M[sl]
+                    buf[sl] *= 0.5
+                L_prev -= buf                              # G_L
+                S_prev -= buf                              # G_S
+                L_new, rank = self._svt(L_prev, mu / 2.0, randomized, polishing)
+                _soft(S_prev, lam * mu / 2.0, out=buf)     # new S
+                # optimality residual (Lin et al. 2009). Its two blocks are
+                # exact negatives, (Y_L - Y_S) - (L_new - S_new), and
+                # Y_L - Y_S = G_L - G_S, so the norm is sqrt(2) * one block.
+                r2 = 0.0
+                for sl in _row_blocks(M):
+                    d = L_prev[sl] - S_prev[sl]
+                    d -= L_new[sl]
+                    d += buf[sl]
+                    r2 += float(np.vdot(d, d))
+                res = np.sqrt(2.0 * r2) / normM
+                res_hist.append(res)
+                d2 = _sqdist(L_new, L) + _sqdist(buf, S)
+                # rotate: old iterates become the previous ones; the G_S
+                # array is reused as the next work buffer
+                L_prev, L = L, L_new
+                S_prev, S, buf = S, buf, S_prev
                 t_prev, t = t, (1.0 + np.sqrt(1.0 + 4.0 * t * t)) / 2.0
 
-            # relative change of (L, S)
-            err = np.sqrt(sqdist(L_new, L) + sqdist(S_new, S)) / normM
-            if mode == "apg":
-                # optimality residual at the new point (Lin et al. 2009).
-                # Its two blocks are exact negatives of each other,
-                # (YL - YS) - (L_new - S_new), so the norm is sqrt(2) * one.
-                np.subtract(YL, YS, out=buf)
-                buf -= L_new
-                buf += S_new
-                res = np.sqrt(2.0 * float(np.vdot(buf, buf))) / normM
-                res_hist.append(res)
-                del YL, YS
-            L_prev, S_prev = L, S
-            L, S = L_new, S_new
-            if mode == "bcd":
-                L_prev = S_prev = None                # not needed: free memory
+            err = np.sqrt(d2) / normM
             self.errors_.append(err)
 
             at_floor = mu <= mu_final_s
@@ -478,7 +512,7 @@ class StablePCP:
                         > self.switch_rate):
                     mode = "apg"
                     self.switched_at_ = it
-                    L_prev, S_prev = L, S
+                    L_prev, S_prev = L.copy(), S.copy()
                     t_prev = t = 1.0
                     res_hist = []
                     n_floor = 0
@@ -515,8 +549,14 @@ class StablePCP:
                           f"lam_scale is probably too small (or sigma too "
                           f"small) for this data.")
         self.n_svd_fallback_ = self._n_fallback
-        self.noise_ = (M - L - S) * scale
-        self.L_, self.S_, self.rank_ = L * scale, S * scale, rank
+        del buf, L_prev, S_prev
+        L *= scale
+        S *= scale
+        M *= scale                                   # our own copy of the input
+        M -= L
+        M -= S                                       # M now holds the noise
+        self.noise_ = M
+        self.L_, self.S_, self.rank_ = L, S, rank
         return self
 
     def _check_fitted(self):
