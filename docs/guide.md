@@ -15,6 +15,7 @@ version introduced the feature; CHANGELOG.md lists changes by version.
 | `max_rank` | None | Hard cap on the rank of L (heuristic, makes the problem non-convex) |
 | `tol` | `"auto"` | Stopping tolerance: `"auto"` stops when the remaining error is about 1/5000 of the noise; or a number, relative to the size of M |
 | `tol_scale` | 1.0 | Multiplies the `"auto"` tolerance: above 1 is rougher and faster, below 1 more precise |
+| `accelerate` | False | Speed up fits that converge slowly (see Solvers) |
 | `max_iter` | 10000 | Most problems converge well before this limit |
 | `solver` | `"auto"` | `"bcd"`: block-coordinate steps (usually fastest); `"apg"`: accelerated proximal gradient (robust when the dense noise is tiny compared with the outliers); `"auto"`: starts with `"bcd"` and switches to `"apg"` if it is nearly stuck |
 | `debias`, `debias_mask_factor` | False, 4.0 | Undo the shrinkage of L (see Debiasing) |
@@ -22,7 +23,7 @@ version introduced the feature; CHANGELOG.md lists changes by version.
 
 After fitting: `L_`, `S_`, `noise_`, `rank_`, `n_iter_`, `converged_`,
 `sparse_fraction_`, `switched_at_`, `debias_rank_`, `solution_`, `missing_`,
-`tol_`, `sigma_`, `sigma_path_`, `lam_`, `mu_`. The docstrings have the full
+`tol_`, `sigma_`, `sigma_path_`, `accel_at_`, `lam_`, `mu_`. The docstrings have the full
 list.
 
 ## Reading S (0.1.0)
@@ -49,7 +50,7 @@ rank or a threshold you choose. With neither, it cuts at the largest gap
 between consecutive components, which can cut too early when the data has a
 large common offset; prefer `trimmed_low_rank()` in that case.
 
-## Solvers (0.1.0)
+## Solvers (0.1.0; `accelerate` 0.5.0)
 
 `solver="auto"` (the default) starts with block-coordinate steps, which are
 usually fastest, and switches to accelerated proximal gradient (APG) if
@@ -62,6 +63,16 @@ two Gram matrices, with an automatic fallback to a full SVD when that would
 lose precision (`n_svd_fallback_` counts those steps). `"exact"` always uses
 the full SVD. `"randomized"` only pays off when the rank of L is small
 relative to the size of the matrix.
+
+`accelerate=True` speeds up fits that converge slowly, such as
+large tables, missing values or fits that need many steps at the final μ.
+After the first plain steps, each step is extrapolated from the last few,
+and an extrapolated step that makes the fit worse is discarded. It only
+switches on when the plain steps still have a long way to go, so quick fits
+and warm-started refits are unchanged. The answer is the same up to the
+tolerance. It uses more memory (about 15 extra arrays the size of M) and has
+no effect with `sigma=0`, `solver="apg"` or `svd="randomized"`. `accel_at_`
+says where it started.
 
 `max_rank` caps the rank of L. It is a heuristic: with it the problem is no
 longer convex, so leave it unset for the exact Stable PCP solution.
