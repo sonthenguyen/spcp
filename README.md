@@ -56,6 +56,9 @@ measure the same thing twice. Ways to get it:
 Too small, and noise leaks into L (high rank) and S (many tiny values).
 Too large, and real signal is thrown away (L is shrunk and flattened).
 
+If you have none of these, `sigma="auto"` estimates it from the data (more data,
+more accurate estimate). Use `sigma=0` when the data has no dense noise at all.
+
 **`lam_scale` (default 1.0)**: how far an entry must be from L to count as an
 outlier. The cutoff is roughly `1.41 × lam_scale × sigma`. The default of 1
 is the standard choice from the theory (λ = 1/√max(m, n), Candès et al., 2011).
@@ -69,14 +72,12 @@ The other settings have defaults that rarely need changing. After fitting,
 the results are in `L_`, `S_`, `noise_` and `rank_`.
 [docs/guide.md](docs/guide.md) lists every option and result and describes
 each feature: reading S, trimming L, solvers, checking a fit, debiasing,
-missing values, warm starts, precision and intervals.
+missing values, warm starts, precision, intervals and the noise level.
 
 ## Future work
 
 Planned, roughly in this order:
 
-- **Automatic noise level**: estimating `sigma` from the data, and an exact
-  fit for data with no dense noise.
 - **A faster solver** for fits that converge slowly.
 - **More cores.** The matrix decomposition in each iteration already uses
   several cores through NumPy; the element-wise steps still use one.

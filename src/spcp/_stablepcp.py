@@ -199,9 +199,28 @@ class StablePCP:
 
     Parameters
     ----------
-    sigma : float, required
+    sigma : float >= 0 or "auto", required
         Standard deviation of the dense noise N, in the units of M.
         Sets the final shrinkage level. (Alternatively pass `mu` directly.)
+        A value you know (instrument precision, repeated measurements, a
+        variance-stabilising transform) is the best choice.
+        "auto" estimates it from the data: fit, measure the typical noise
+        level of the residual M - L, and repeat until the value used and the
+        value measured agree within 2% (see `sigma_`, `sigma_path_`). The
+        noise level is measured with a second Stable PCP fit on
+        log|residual|, which turns noise of varying size into an even-noise
+        problem with a known sigma; its median over the entries is the
+        estimate. This costs several extra fits. More data gives a more
+        accurate estimate. It follows the typical size of the noise, so
+        occasional large spikes in the noise do not raise it.
+        sigma=0 means there is no dense noise (M = L + S exactly, as in
+        compressed video where most values repeat exactly). That case is
+        solved as principal component pursuit: minimise ||L||_* + lam ||S||_1
+        subject to L + S = M on the observed entries, with the same lam and no
+        other setting. `debias` does not apply and noise_ is zero where
+        observed. "auto" switches to sigma=0 when the data has no dense noise:
+        the leftover keeps shrinking with the value tried, so no positive
+        value can match it.
     lam_scale : float, default 1.0
         Multiplier on the default sparsity weight. Larger -> fewer outliers.
         Outlier cutoff is roughly sqrt(2) * lam_scale * sigma.
@@ -308,6 +327,11 @@ class StablePCP:
     switched_at_ : int or None iteration where solver='auto' switched to APG
     lam_, mu_, mu_init_ : float  parameters actually used
     tol_ : float               stopping tolerance actually used
+    sigma_ : float or None     noise level used: `sigma`, or the estimate when
+                               sigma="auto" (0 = no dense noise; None if only
+                               mu was given)
+    sigma_path_ : list or None with sigma="auto": (value tried, value measured)
+                               for each round
     solution_ : (L, S)         the fit before debiasing (L_, S_ when
                                debias=False): pass it as `init` to warm-start
                                a fit of similar data
@@ -362,10 +386,16 @@ class StablePCP:
                 raise ValueError(
                     "sigma (std of the dense noise) is required; results depend "
                     "strongly on it. Alternatively pass mu directly.")
-            if not self.sigma > 0:
-                raise ValueError("sigma must be > 0")
-        elif not self.mu > 0:
-            raise ValueError("mu must be > 0")
+            if isinstance(self.sigma, str):
+                if self.sigma != "auto":
+                    raise ValueError("sigma must be a number >= 0 or 'auto'")
+            elif not self.sigma >= 0:
+                raise ValueError("sigma must be >= 0")
+        else:
+            if not self.mu > 0:
+                raise ValueError("mu must be > 0")
+            if isinstance(self.sigma, str) and self.sigma != "auto":
+                raise ValueError("sigma must be a number >= 0 or 'auto'")
         if self.lam is not None and not self.lam > 0:
             raise ValueError("lam must be > 0")
         if not self.lam_scale > 0:
@@ -409,6 +439,92 @@ class StablePCP:
             raise ValueError("debias_mask_factor must be >= 0")
 
     # ------------------------------------------------------------------
+    def _fit_pcp(self, M, miss, lam, init):
+        """sigma = 0: principal component pursuit by the inexact augmented
+        Lagrangian method (Lin, Chen and Ma, 2010):
+
+            minimise ||L||_* + lam ||S||_1   subject to  L + S = M (observed).
+
+        Missing entries are filled from L at each step (S is zero there), so
+        the constraint only binds where M is observed. M has its missing
+        entries set to 0 on entry.
+        """
+        scale = float(np.max(np.abs(M)))
+        if scale == 0.0:
+            scale = 1.0
+        M = M / scale
+        has_miss = miss is not None
+        normM = max(np.linalg.norm(M), np.finfo(float).tiny)
+        tol = 1e-7 if isinstance(self.tol, str) else float(self.tol)
+        self.tol_ = tol
+        self.lam_, self.mu_, self.mu_init_ = lam, 0.0, 0.0
+        self._rng = np.random.default_rng(self.random_state)
+        self._k_pred = max(1, int(self.rsvd_init_ratio * min(M.shape)))
+        self._n_gram = self._n_fallback = 0
+        if init is not None:
+            L = np.array(init[0], dtype=float) / scale
+            S = np.array(init[1], dtype=float) / scale
+            if L.shape != M.shape or S.shape != M.shape:
+                raise ValueError("init must be (L, S) with the shape of M")
+        else:
+            L = np.zeros_like(M)
+            S = np.zeros_like(M)
+        if has_miss:
+            M[miss] = L[miss]
+        norm2 = max(_spectral_norm(M), np.finfo(float).tiny)
+        Y = M / max(norm2, np.max(np.abs(M)) / lam)    # dual start (their eq. 10)
+        mu = 1.25 / norm2
+        mu_max = mu * 1e7
+        rho = 1.5
+        self.errors_ = []
+        self.converged_ = False
+        self.switched_at_ = None
+        rank = 0
+        for it in range(1, int(self.max_iter) + 1):
+            if has_miss:
+                M[miss] = L[miss] + S[miss]            # unobserved: no constraint
+            L, rank = self._svt(M - S + Y / mu, 1.0 / mu, False, True)
+            S = M - L + Y / mu
+            _soft(S, lam / mu, out=S)
+            if has_miss:
+                np.copyto(S, 0.0, where=miss)
+            Z = M - L - S
+            if has_miss:
+                np.copyto(Z, 0.0, where=miss)
+            Y += mu * Z
+            mu = min(mu * rho, mu_max)
+            err = float(np.linalg.norm(Z)) / normM
+            self.errors_.append(err)
+            if self.verbose and (it % 10 == 0 or it == 1):
+                print(f"iter {it:5d}  pcp  rank {rank:4d}  "
+                      f"nnz(S) {np.count_nonzero(S):8d}  residual {err:.2e}")
+            if err <= tol:
+                self.converged_ = True
+                break
+        self.n_iter_ = it
+        self.dist_est_ = err
+        if not self.converged_:
+            warnings.warn(f"StablePCP (sigma=0) did not converge in "
+                          f"{self.max_iter} iterations (residual {err:.2e} > "
+                          f"tol {tol:.1e}). Increase max_iter.")
+        frac_s = np.count_nonzero(S) / S.size
+        self.sparse_fraction_ = frac_s
+        if frac_s > 0.5:
+            warnings.warn(f"{100 * frac_s:.0f}% of entries were classified as "
+                          f"outliers (S). That is not a sparse decomposition: "
+                          f"lam_scale is probably too small for this data.")
+        self.n_svd_fallback_ = self._n_fallback
+        self.debias_rank_ = None
+        L *= scale
+        S *= scale
+        noise = np.zeros_like(L)
+        if has_miss:
+            noise[miss] = np.nan
+        self.solution_ = (L, S)
+        self.noise_ = noise
+        self.L_, self.S_, self.rank_ = L, S, rank
+        return self
+
     def _svt(self, X, thr, randomized, accurate):
         """Singular value thresholding: returns (U*s_shrunk) @ Vt and rank."""
         n_min = min(X.shape)
@@ -474,7 +590,13 @@ class StablePCP:
                 raise ValueError("M has no observed entries")
             if self.solver == "apg":
                 raise ValueError("missing values need solver='auto' or 'bcd'")
-        sigma = self.sigma
+        if isinstance(self.sigma, str):               # "auto": estimate it first
+            sigma, start = self._auto_sigma(M)
+            if init is None:
+                init = start
+        else:
+            sigma, self.sigma_path_ = self.sigma, None
+        self.sigma_ = None if sigma is None else float(sigma)
         if has_miss:
             M[miss] = 0.0
         self.missing_ = miss if has_miss else None
@@ -482,6 +604,8 @@ class StablePCP:
         m, n = M.shape
         n_max = max(m, n)
         lam = self.lam if self.lam is not None else self.lam_scale / np.sqrt(n_max)
+        if self.mu is None and sigma == 0:
+            return self._fit_pcp(M, miss if has_miss else None, lam, init)
         mu_final = self.mu if self.mu is not None else \
             np.sqrt(2.0 * n_max) * sigma
 
@@ -692,6 +816,98 @@ class StablePCP:
         self.L_, self.S_, self.rank_ = L, S, rank
         return self
 
+    def _auto_sigma(self, M):
+        """Estimate the noise level for sigma="auto".
+
+        Looks for the value s at which a fit with sigma = s leaves a residual
+        whose typical noise level is s again. Returns (sigma, warm start for
+        the final fit or None). M may contain NaN (missing).
+        """
+        params = {k: getattr(self, k) for k in self._param_names()}
+        params.update(debias=True, verbose=False)     # the unshrunk residual
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")           # all-missing columns
+            dev = np.abs(M - np.nanmedian(M, axis=0))
+            s = 1.4826 * float(np.nanmedian(dev))     # spread of the data: a start from above
+            if not (np.isfinite(s) and s > 0):
+                s = float(np.nanstd(M))
+        if not (np.isfinite(s) and s > 0):
+            raise ValueError("sigma='auto': the data has no variation to "
+                             "estimate the noise from")
+        floor = 1e-6 * float(np.nanmax(np.abs(M)))    # below this the data is noise-free in practice
+        NOISE_FREE = 0.2       # measured < this x tried, after a round started from a measurement
+        rtol, path, lo, hi, prev = 0.02, [], None, None, None
+        confirming = False
+        self.sigma_path_ = path
+        # Speed: each round starts from the previous round's solution (the
+        # problem changes only through sigma), and with tol="auto" the trial
+        # fits stop at about 2% of the noise rather than 0.02%, matching the
+        # 2% acceptance rule below. A round that looks accepted is refitted
+        # at full precision (from its rough solution) before it is accepted.
+        rough = 100.0 if isinstance(self.tol, str) else 1.0
+        start = None
+
+        def trial_fit(s, mult, init):
+            # Keep only what the search needs (the warm start and the measured
+            # noise): the trial's other full-size arrays are freed at once, so
+            # they do not sit in memory while the next trial runs.
+            trial = StablePCP(**dict(params, sigma=s, tol_scale=mult * self.tol_scale))
+            trial.fit(M, init=init)
+            m = _typical_noise(M - trial.L_)
+            sol, rank = trial.solution_, trial.rank_
+            del trial
+            return sol, rank, m
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")           # trial fits may warn; the final fit reports
+            for _ in range(12):
+                start, rank, m = trial_fit(s, rough, start)
+                if rough != 1.0 and m > floor and abs(m - s) <= rtol * s:
+                    start, rank, m = trial_fit(s, 1.0, start)
+                path.append((float(s), float(m)))
+                if self.verbose:
+                    print(f"sigma='auto': tried {s:.4g}, measured {m:.4g} "
+                          f"(rank {rank})")
+                if m <= floor:
+                    return 0.0, None                  # nothing left at all: no dense noise
+                if len(path) >= 2 and m < NOISE_FREE * s:
+                    # The leftover vanished when treated as noise: it was
+                    # structure, not noise. Confirm once, one step lower (s/5,
+                    # not the tiny measured value, whose fit would be slow):
+                    # real noise reappears there (measured > tried), while in
+                    # noise-free data the leftover collapses again. Then there
+                    # is no positive value where tried and measured agree, and
+                    # the answer is sigma = 0 (exact M = L + S).
+                    if confirming:
+                        return 0.0, None
+                    confirming = True
+                    hi = s if hi is None else min(hi, s)
+                    prev, s = (s, m), max(s / 5.0, floor)
+                    continue
+                confirming = False
+                if abs(m - s) <= rtol * s:
+                    return s, start                   # same problem as the final fit
+                if m > s:
+                    lo = s if lo is None else max(lo, s)
+                else:
+                    hi = s if hi is None else min(hi, s)
+                nxt = m                               # plain step: use what was measured
+                if prev is not None:                  # faster: secant step on measured - tried
+                    g0, g1 = prev[1] - prev[0], m - s
+                    if g1 != g0:
+                        sec = s - g1 * (s - prev[0]) / (g1 - g0)
+                        # accept it only near the plain step (it extrapolates)
+                        if np.isfinite(sec) and m / 3.0 < sec < 3.0 * m:
+                            nxt = sec
+                if lo is not None and hi is not None and not lo < nxt < hi:
+                    nxt = float(np.sqrt(lo * hi))     # keep inside the bracket
+                prev, s = (s, m), max(float(nxt), floor)
+        best = min(path, key=lambda p: abs(p[1] - p[0]) / p[0])
+        warnings.warn("sigma='auto' did not settle within 2% in 12 rounds; "
+                      f"using {best[0]:.4g} (measured {best[1]:.4g}). "
+                      "See sigma_path_.")
+        return best[0], None
+
     def _debias(self, M, L, S, cut, mu, fit_rank, miss=None):
         """Undo the shrinkage of L while keeping Stable PCP's decisions.
 
@@ -825,6 +1041,9 @@ class StablePCP:
             raise ValueError(f"candidates must be a list or one of {modes}")
         if not (effect in ("auto", "residual") or (not isinstance(effect, str) and len(effect) == 2)):
             raise ValueError("effect must be 'auto', 'residual' or (low, high)")
+        if not isinstance(effect, str) and not self.sigma_:
+            raise ValueError("effect=(low, high) is in units of sigma, which is 0 "
+                             "here; use effect='auto' or 'residual'")
         rng = np.random.default_rng(random_state)
         M0 = self.L_ + self.S_ + self.noise_            # the data that was fitted
         m, n = M0.shape
@@ -879,6 +1098,7 @@ class StablePCP:
 
         params = {k: getattr(self, k) for k in self._param_names()}
         params["verbose"] = False
+        params["sigma"] = self.sigma_                 # refits do not re-estimate it
         errors, cal_est = [], []
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -903,7 +1123,7 @@ class StablePCP:
                             Mb[w] += src[er, ec]
                     else:
                         Mb[w] += (rng.choice([-1.0, 1.0]) *
-                                  rng.uniform(*effect) * self.sigma)
+                                  rng.uniform(*effect) * self.sigma_)
                     planted.append(w)
                 if not planted:
                     raise ValueError("no room for calibration windows")
@@ -978,3 +1198,48 @@ class StablePCP:
     def get_rank(self):
         self._check_fitted()
         return self.rank_
+
+
+# ----------------------------------------------------------------------------
+# noise level from residuals (used by sigma="auto")
+# ----------------------------------------------------------------------------
+_LOG_ABS_SD = float(np.pi / (2.0 * np.sqrt(2.0)))    # sd of log|z|, z standard normal (about 1.11)
+_PURE_LEVEL = {}                                     # shape -> what the steps below give on pure noise of scale 1
+
+
+def _log_level(A):
+    """Fitted log noise scale of each entry. A = log|residual| (NaN = missing).
+
+    Centred at its median first, so the units of the data do not matter.
+    """
+    a0 = float(np.nanmedian(A))
+    return StablePCP(sigma=_LOG_ABS_SD, debias=True).fit(A - a0).L_ + a0
+
+
+def _noise_scale(res):
+    """Noise standard deviation of every entry, from residuals M - L.
+
+    For noise of any scale s, log|noise| = log s + (a term whose spread is the
+    same everywhere, sd about 1.11). So the log sizes of the residuals are
+    again "regular part + a few exceptions (events) + even noise" with a known
+    sigma, and a second Stable PCP fit gives the regular part: the log scale.
+    Its level is set by running the same steps on pure noise of scale 1.
+    """
+    absr = np.abs(res)
+    med = float(np.nanmedian(absr))
+    if not med > 0:
+        return np.zeros(res.shape)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        A = np.log(np.maximum(absr, 1e-3 * med))     # NaN stays NaN
+        if res.shape not in _PURE_LEVEL:
+            z = np.random.default_rng(123).normal(size=res.shape)
+            _PURE_LEVEL[res.shape] = float(np.median(_log_level(np.log(np.abs(z)))))
+        return np.exp(_log_level(A) - _PURE_LEVEL[res.shape])
+
+
+def _typical_noise(res):
+    """Median noise standard deviation over the observed entries of M - L."""
+    scale = _noise_scale(res)
+    obs = ~np.isnan(res)
+    return float(np.median(scale[obs])) if obs.any() else 0.0

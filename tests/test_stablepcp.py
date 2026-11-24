@@ -98,8 +98,6 @@ def test_errors():
     with pytest.raises(ValueError):
         StablePCP(sigma=-1).fit(M)
     with pytest.raises(ValueError):
-        StablePCP(sigma=0).fit(M)
-    with pytest.raises(ValueError):
         StablePCP(sigma=1).fit(np.ones(5))
     with pytest.raises(ValueError):
         StablePCP(sigma=1, svd="fast").fit(M)
@@ -617,3 +615,200 @@ def test_intervals_need_sigma_and_a_fit():
     with pytest.raises(ValueError, match="sigma"):
         m.conformal([(0, 0)])
 
+
+# ---------------------------------------------------------------- sigma="auto" and sigma=0
+@pytest.mark.parametrize("true", [0.05, 0.5, 3.0])
+def test_sigma_auto_recovers_a_known_noise_level(true):
+    L0, S0, M = make_data(m=150, n=120, r=4, sigma=true, seed=3)
+    mod = StablePCP(sigma="auto", debias=True).fit(M)
+    assert abs(mod.sigma_ / true - 1) < 0.12
+    # as accurate as a fit that is told the true noise level
+    oracle = StablePCP(sigma=true, debias=True).fit(M)
+    assert mod.rank_ == oracle.rank_ == 4
+    assert rel(mod.L_, L0) <= 1.1 * rel(oracle.L_, L0) + 0.01
+    tried, measured = mod.sigma_path_[-1]
+    assert tried == mod.sigma_ and abs(measured - tried) <= 0.02 * tried
+    # a fixed sigma is reported as given, with no path
+    fixed = StablePCP(sigma=true).fit(M)
+    assert fixed.sigma_ == true and fixed.sigma_path_ is None
+    assert StablePCP(mu=fixed.mu_, tol=1e-6).fit(M).sigma_ is None
+
+
+def test_sigma_auto_gives_the_same_fit_as_passing_that_sigma():
+    L0, S0, M = make_data(m=120, n=100, r=3, sigma=0.3, seed=5)
+    auto = StablePCP(sigma="auto").fit(M)
+    direct = StablePCP(sigma=auto.sigma_).fit(M)
+    assert auto.rank_ == direct.rank_
+    assert rel(auto.L_, direct.L_) < 1e-3 and rel(auto.S_, direct.S_) < 1e-3
+
+
+def test_sigma_auto_does_not_depend_on_units():
+    L0, S0, M = make_data(m=100, n=90, r=3, sigma=0.2, seed=7)
+    a = StablePCP(sigma="auto").fit(M)
+    b = StablePCP(sigma="auto").fit(1e4 * M)
+    c = StablePCP(sigma="auto").fit(1e-5 * M)
+    assert abs(b.sigma_ / (1e4 * a.sigma_) - 1) < 1e-3
+    assert abs(c.sigma_ / (1e-5 * a.sigma_) - 1) < 1e-3
+    assert rel(b.L_ / 1e4, a.L_) < 1e-3
+
+
+def test_sigma_auto_with_missing_values():
+    L0, S0, M = make_data(m=150, n=120, r=4, sigma=0.5, seed=9)
+    Mm = M.copy()
+    Mm[np.random.default_rng(0).random(M.shape) < 0.2] = np.nan
+    mod = StablePCP(sigma="auto", debias=True).fit(Mm)
+    assert abs(mod.sigma_ / 0.5 - 1) < 0.15
+    assert np.all(np.isfinite(mod.L_)) and mod.rank_ == 4
+
+
+def test_sigma_auto_is_estimated_once_and_reused_by_refits(monkeypatch):
+    L0, S0, M = _small_data()
+    mod = StablePCP(sigma="auto", debias=True).fit(M)
+    assert abs(mod.sigma_ - 1.0) < 0.15
+    same = StablePCP(sigma=mod.sigma_, debias=True).fit(M)
+    w = [(slice(5, 8), 3), (slice(20, 23), 7)]
+    ref_c = same.conformal(w, n_cal=40, random_state=0)
+
+    def no_more(self, M):
+        raise AssertionError("sigma was estimated again in a refit")
+    monkeypatch.setattr(StablePCP, "_auto_sigma", no_more)
+    c = mod.conformal(w, n_cal=40, random_state=0)
+    assert mod.sigma == "auto"                       # the setting itself is kept
+    np.testing.assert_allclose(c["low"], ref_c["low"], rtol=0.05, atol=0.05)
+    np.testing.assert_allclose(c["high"], ref_c["high"], rtol=0.05, atol=0.05)
+
+
+def test_sigma_auto_on_noise_free_data_uses_sigma_zero():
+    L0, S0, M = make_data(m=80, n=80, r=3, sigma=0.0, seed=11)
+    mod = StablePCP(sigma="auto").fit(M)
+    assert mod.sigma_ == 0 and len(mod.sigma_path_) <= 3
+    assert rel(mod.L_, L0) < 1e-4
+
+
+def _video_like(seed=0, frames=60, h=20, w=30):
+    """Integer frames: a fixed background, a brightness step half way, and a
+    bright square moving across. Most pixels repeat exactly: no dense noise."""
+    rng = np.random.default_rng(seed)
+    bg = rng.integers(40, 200, size=(h, w)).astype(float)
+    V = np.repeat(bg[None], frames, 0)
+    V[frames // 2:] += 10.0
+    fg = np.zeros_like(V, bool)
+    for f in range(frames):
+        c = (2 * f) % (w - 5)
+        V[f, 8:13, c:c + 5] = 250.0
+        fg[f, 8:13, c:c + 5] = True
+    return V.reshape(frames, -1), fg.reshape(frames, -1)
+
+
+def test_sigma_auto_on_video_like_data_stops_fast_and_finds_the_foreground():
+    M, fg = _video_like()
+    mod = StablePCP(sigma="auto").fit(M)
+    assert mod.sigma_ == 0 and len(mod.sigma_path_) <= 3
+    found = np.abs(mod.S_) > 1.0
+    assert found[fg].mean() > 0.9 and found[~fg].mean() < 0.01
+    assert mod.rank_ <= 3
+
+
+def test_sigma_zero_is_exact_and_handles_missing_values():
+    L0, S0, M = make_data(m=100, n=90, r=3, sigma=0.0, seed=13)
+    mod = StablePCP(sigma=0).fit(M)
+    assert mod.converged_ and mod.mu_ == 0 and mod.debias_rank_ is None
+    assert rel(mod.L_, L0) < 1e-4 and rel(mod.S_, S0) < 1e-3
+    assert np.all(mod.noise_ == 0)
+    Mm = M.copy()
+    hide = np.random.default_rng(1).random(M.shape) < 0.2
+    Mm[hide] = np.nan
+    mm = StablePCP(sigma=0, debias=True).fit(Mm)
+    assert rel(mm.L_[hide], L0[hide]) < 1e-3
+    assert np.isnan(mm.noise_[hide]).all() and np.all(mm.S_[hide] == 0)
+    # warm start reaches the same answer
+    again = StablePCP(sigma=0).fit(M, init=mod.solution_)
+    assert rel(again.L_, mod.L_) < 1e-4
+
+
+def test_sigma_zero_intervals():
+    L0, S0, M = make_data(m=60, n=40, r=2, sigma=0.0, seed=17)
+    mod = StablePCP(sigma=0).fit(M)
+    w = [(slice(5, 8), 3), (slice(20, 23), 7)]
+    with pytest.raises(ValueError, match="units of sigma"):
+        mod.conformal(w, n_cal=20, effect=(2, 5))
+    r = mod.conformal(w, n_cal=40, random_state=0)
+    assert np.all(np.isfinite(r["low"])) and np.all(r["low"] <= r["high"])
+
+
+def test_sigma_auto_rejects_bad_input():
+    with pytest.raises(ValueError):
+        StablePCP(sigma="estimate").fit(np.ones((5, 5)))
+    with pytest.raises(ValueError, match=">= 0"):
+        StablePCP(sigma=-1.0).fit(np.ones((5, 5)))
+    with pytest.raises(ValueError, match="no variation"):
+        StablePCP(sigma="auto").fit(np.full((6, 6), 2.5))
+
+
+def test_sigma_auto_one_dip_does_not_mean_noise_free(monkeypatch):
+    """A single collapse of the measured noise is not enough: the search
+    confirms one step lower, and real noise reappears there."""
+    import spcp._stablepcp as sp
+    calls = []
+
+    def scripted(res):                    # true noise 0.5, except one odd low reading
+        calls.append(1)
+        return 0.01 if len(calls) == 2 else 0.5
+    monkeypatch.setattr(sp, "_typical_noise", scripted)
+    L0, S0, M = make_data(m=80, n=60, r=3, sigma=0.5, seed=21)
+    mod = StablePCP(sigma="auto").fit(M)
+    assert abs(mod.sigma_ / 0.5 - 1) <= 0.03
+    tried = [a for a, b in mod.sigma_path_]
+    assert abs(tried[2] - tried[1] / 5) < 1e-12  # the confirmation step
+
+
+def _record_trials(monkeypatch):
+    """Record every fit made inside the sigma='auto' search."""
+    from spcp._stablepcp import _LOG_ABS_SD     # sigma of the measuring fits
+    calls, orig = [], StablePCP.fit
+
+    def spy(self, M, init=None):
+        out = orig(self, M, init=init)
+        if not isinstance(self.sigma, str) and self.sigma != _LOG_ABS_SD:
+            calls.append(dict(sigma=self.sigma, init=init is not None,
+                              mult=self.tol_scale,
+                              converged=self.converged_))
+        return out
+    monkeypatch.setattr(StablePCP, "fit", spy)
+    return calls
+
+
+@pytest.mark.parametrize("true", [0.3, 1.0])
+def test_sigma_auto_fast_search_agrees_with_full_precision_search(true):
+    # rough trial rounds (tol="auto") and full-precision rounds (fixed tol)
+    # must settle on the same sigma, within the search's own 2% rule
+    L0, S0, M = make_data(m=120, n=100, r=3, sigma=true, seed=5)
+    fast = StablePCP(sigma="auto").fit(M).sigma_
+    full = StablePCP(sigma="auto", tol=1e-7).fit(M).sigma_
+    assert abs(fast - full) <= 0.02 * full
+    assert abs(fast - true) <= 0.1 * true
+
+
+def test_sigma_auto_rounds_are_warm_started_and_accepted_at_full_precision(monkeypatch):
+    L0, S0, M = make_data(m=120, n=100, r=3, sigma=0.5, seed=6)
+    calls = _record_trials(monkeypatch)
+    mod = StablePCP(sigma="auto").fit(M)
+    trials = calls                              # the final fit is mod itself
+    assert len(trials) >= 3
+    assert not trials[0]["init"] and all(c["init"] for c in trials[1:])
+    assert trials[0]["mult"] > 1.0              # search rounds are rough
+    assert trials[-1]["mult"] == 1.0            # the accepted round is exact
+    assert trials[-1]["sigma"] == mod.sigma_
+    assert mod.converged_
+
+
+def test_sigma_auto_on_larger_noise_free_data_converges_every_round(monkeypatch):
+    # in noise-free data the search tries small sigmas, where a cold fit can
+    # crawl; warm starts keep every round converging
+    M, fg = _video_like(frames=90, h=40, w=60)
+    calls = _record_trials(monkeypatch)
+    mod = StablePCP(sigma="auto").fit(M)
+    assert mod.sigma_ == 0 and len(mod.sigma_path_) <= 3
+    assert all(c["converged"] for c in calls)
+    found = np.abs(mod.S_) > 1.0
+    assert found[fg].mean() > 0.9 and found[~fg].mean() < 0.01

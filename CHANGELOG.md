@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.0
+Fits with a numeric `sigma` give the same results as 0.3.0.
+
+New:
+- `sigma="auto"` estimates the noise level from the data: it looks for the
+  value at which a fit leaves a residual with that same typical noise level.
+  The value used is in `sigma_` and the search in `sigma_path_`. It costs
+  several extra fits, and more data gives a more accurate estimate. It
+  follows the typical size of the noise, so occasional large spikes do not
+  raise it. A known value is still the better choice. `conformal` reuses the
+  estimate instead of repeating it.
+- `sigma=0`: no dense noise (M = L + S exactly on the observed entries),
+  solved as principal component pursuit with the same `lam` and no other
+  setting. Works with missing values and warm starts; `debias` does not
+  apply. `sigma="auto"` switches to it when the data has no dense noise.
+
 ## 0.3.0
 No change to fits: `fit` gives the same results as 0.2.0.
 

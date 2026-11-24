@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spcp"
-version = "0.3.0"
+version = "0.4.0"
 description = "Stable Principal Component Pursuit: split a matrix into low-rank + sparse outliers + dense noise"
 readme = "README.md"
 license = "MIT"
