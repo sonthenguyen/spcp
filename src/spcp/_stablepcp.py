@@ -313,6 +313,11 @@ class StablePCP:
                                a fit of similar data
     missing_ : ndarray or None boolean mask of the missing (NaN) entries
     debias_rank_ : int or None rank kept by debias (None if debias=False)
+
+    Methods (after fit)
+    -------------------
+    conformal(windows, ...)    prediction intervals for what the data would
+                               have been in chosen cells
     """
 
     def __init__(self, sigma=None, lam_scale=1.0, lam=None, mu=None,
@@ -738,6 +743,209 @@ class StablePCP:
             support = new_support
         self.debias_rank_ = r
         return L, S, r
+
+    def conformal(self, windows, level=0.9, n_cal=200, per_refit=None,
+                  effect="auto", candidates="same_cols", statistic=None, scale=None,
+                  n_groups=1, random_state=None, verbose=False):
+        """Prediction intervals for "what would the data have been in these windows".
+
+        Split-conformal calibration with held-out windows: fake events are
+        planted in calibration windows (copies of your windows moved
+        elsewhere in the matrix), the model is refitted, and its errors on
+        those windows - against the original data - give the interval width.
+        This does not assume the low-rank model is right.
+        Costs about n_cal / per_refit extra fits.
+
+        Parameters
+        ----------
+        windows : list of index tuples, e.g. (slice(r0, r0 + 4), j)
+            The cells of each event of interest (indexing M / L_).
+        level : float
+            Target coverage of the intervals.
+        n_cal : int
+            Number of calibration windows.
+        per_refit : int or None
+            Calibration windows per refit (they never overlap each other or
+            your windows). None: 40 when planting; when hiding, as many as
+            keep about 5% of the observed cells hidden (at least 1).
+        effect : "auto", "residual" or (low, high)
+            What to plant. "auto": the estimated effect of a randomly chosen
+            event (its S_ values), so fake events look like the real ones.
+            "residual": the event's full departure from L (data - L_), which
+            does not understate events that partly leak into L.
+            (low, high): a shift per cell, uniform in [low, high] * sigma with
+            a random sign per window.
+        candidates : "same_cols", "same_rows", "auto", "random" or a list
+            Where calibration windows go. Each is a copy of one of your
+            windows moved to other rows in the same columns ("same_cols",
+            the default), to other columns in the same rows ("same_rows"),
+            anywhere ("random"), or half and half ("auto"). A list of windows
+            (same shape as the events) uses those instead. With rows = time
+            and columns = units, "same_cols" calibrates each unit on its own
+            history, which matters when units differ in how predictable they
+            are; transpose (or use "same_rows") if your time runs along
+            columns.
+        statistic : callable(V, window) -> float, optional
+            Quantity of interest; default V[window].sum(). Applied to the
+            original data (truth) and to the fitted L (counterfactual).
+        scale : callable(estimate) -> float, optional
+            Divides calibration errors so windows of different size are
+            comparable, e.g. lambda c: max(c, 1) when errors grow in proportion
+            to the size of the window (counts, totals).
+        n_groups : int
+            Calibrate separately within this many groups of windows of similar
+            estimated size (quantiles of the calibration estimates). With 1,
+            all windows share one interval rule, so if the scale is not quite
+            right, small and large windows get too wide or too narrow
+            intervals.
+
+        Hidden windows: if your windows are missing (NaN) in the fitted
+        data, e.g. a treated unit's cells after an intervention, calibration
+        hides same-shaped observed windows instead of planting fake events,
+        refits, and compares the filled-in values with the real ones (a
+        placebo test turned into intervals). `effect` is then not used, and
+        candidates="same_rows" (other units over the same period) is
+        usually the natural choice.
+
+        Returns
+        -------
+        dict with estimate, low, high (one per window), cal_errors (scaled
+        errors on the calibration windows) and cal_estimates (the model's
+        estimate on each calibration window, for diagnostics).
+        Coverage is approximate: it assumes the event windows behave like
+        the calibration windows.
+        """
+        self._check_fitted()
+        if self.sigma is None:
+            raise ValueError("conformal needs sigma (the noise level)")
+        if not 0 < level < 1:
+            raise ValueError("level must be in (0, 1)")
+        modes = ("auto", "same_cols", "same_rows", "random")
+        if isinstance(candidates, str) and candidates not in modes:
+            raise ValueError(f"candidates must be a list or one of {modes}")
+        if not (effect in ("auto", "residual") or (not isinstance(effect, str) and len(effect) == 2)):
+            raise ValueError("effect must be 'auto', 'residual' or (low, high)")
+        rng = np.random.default_rng(random_state)
+        M0 = self.L_ + self.S_ + self.noise_            # the data that was fitted
+        m, n = M0.shape
+        stat = statistic or (lambda V, w: float(np.sum(V[w])))
+        scl = scale or (lambda c: 1.0)
+        windows = list(windows)
+        if not windows:
+            raise ValueError("no windows given")
+
+        def cells(w):
+            mask = np.zeros((m, n), bool)
+            mask[w] = True
+            return np.nonzero(mask)                     # (rows, cols) arrays
+
+        ev = [cells(w) for w in windows]
+        busy = np.zeros((m, n), bool)
+        for rr, cc in ev:
+            busy[rr, cc] = True
+        miss = getattr(self, "missing_", None)
+        hide = False
+        if miss is not None:
+            hidden = [bool(miss[rr, cc].all()) for rr, cc in ev]
+            observed = [not miss[rr, cc].any() for rr, cc in ev]
+            if all(hidden):
+                hide = True
+            elif not all(observed):
+                raise ValueError("windows must be either all missing (hidden) "
+                                 "or all observed")
+            busy |= miss                        # calibrate only where observed
+        if per_refit is None:
+            if hide:
+                size = np.mean([len(rr) for rr, _ in ev])
+                per_refit = max(1, int(0.05 * (m * n - miss.sum()) / size))
+            else:
+                per_refit = 40
+
+        def calib_window():
+            """Returns (cells of the calibration window, index of source event)."""
+            i = int(rng.integers(len(ev)))
+            if not isinstance(candidates, str):
+                return cells(candidates[rng.integers(len(candidates))]), i
+            rr, cc = ev[i]
+            mode = candidates
+            if mode == "auto":
+                mode = "same_cols" if rng.random() < 0.5 else "same_rows"
+            dr = dc = 0
+            if mode in ("same_cols", "random"):
+                dr = int(rng.integers(-rr.min(), m - rr.max()))
+            if mode in ("same_rows", "random"):
+                dc = int(rng.integers(-cc.min(), n - cc.max()))
+            return (rr + dr, cc + dc), i
+
+        params = {k: getattr(self, k) for k in self._param_names()}
+        params["verbose"] = False
+        errors, cal_est = [], []
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            while len(errors) < n_cal:
+                Mb = M0.copy()
+                used = busy.copy()
+                planted = []
+                tries = 0
+                want = min(per_refit, n_cal - len(errors))
+                while len(planted) < want and tries < 100 * per_refit:
+                    tries += 1
+                    w, i = calib_window()
+                    if used[w].any():
+                        continue
+                    used[w] = True
+                    if hide:
+                        Mb[w] = np.nan                     # hide, as the real window
+                    elif effect in ("auto", "residual"):
+                        er, ec = ev[i]
+                        if len(er) == len(w[0]):
+                            src = self.S_ if effect == "auto" else M0 - self.L_
+                            Mb[w] += src[er, ec]
+                    else:
+                        Mb[w] += (rng.choice([-1.0, 1.0]) *
+                                  rng.uniform(*effect) * self.sigma)
+                    planted.append(w)
+                if not planted:
+                    raise ValueError("no room for calibration windows")
+                Lb = StablePCP(**params).fit(Mb, init=self.solution_).L_
+                for w in planted:
+                    est = stat(Lb, w)
+                    errors.append((stat(M0, w) - est) / scl(est))
+                    cal_est.append(est)
+                if verbose:
+                    print(f"conformal: {len(errors)}/{n_cal} calibration windows")
+        errors = np.array(errors)
+        cal_est = np.array(cal_est)
+        est = np.array([stat(self.L_, w) for w in windows])
+        s = np.array([scl(e) for e in est])
+        a = (1.0 - level) / 2.0
+
+        def quantiles(e):
+            # finite-sample conformal quantiles
+            k = len(e)
+            return (np.quantile(e, max(0.0, np.floor(a * (k + 1)) / k)),
+                    np.quantile(e, min(1.0, np.ceil((1 - a) * (k + 1)) / k)))
+
+        n_groups = max(1, int(n_groups))
+        if n_groups == 1:
+            qlo, qhi = quantiles(errors)
+        else:
+            cuts = np.quantile(cal_est, np.linspace(0, 1, n_groups + 1)[1:-1])
+            g_cal, g_ev = np.digitize(cal_est, cuts), np.digitize(est, cuts)
+            qlo, qhi = np.empty(len(est)), np.empty(len(est))
+            for g in range(n_groups):
+                eg = errors[g_cal == g]
+                if len(eg) < 20:
+                    raise ValueError("too few calibration windows per group: "
+                                     "increase n_cal or lower n_groups")
+                qlo[g_ev == g], qhi[g_ev == g] = quantiles(eg)
+        return {"estimate": est, "low": est + qlo * s, "high": est + qhi * s,
+                "cal_errors": errors, "cal_estimates": cal_est}
+
+    def _param_names(self):
+        import inspect
+        return [p for p in inspect.signature(StablePCP.__init__).parameters
+                if p != "self"]
 
     def _check_fitted(self):
         if not hasattr(self, "L_"):
