@@ -78,7 +78,6 @@ missing values, warm starts, precision, intervals and the noise level.
 
 Planned, roughly in this order:
 
-- **A faster solver** for fits that converge slowly.
 - **More cores.** The matrix decomposition in each iteration already uses
   several cores through NumPy; the element-wise steps still use one.
 - **GPU support**, for matrices that are very large in both dimensions.

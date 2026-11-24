@@ -2,4 +2,4 @@
 from ._stablepcp import StablePCP, trim_rank
 
 __all__ = ["StablePCP", "trim_rank"]
-__version__ = "0.4.0"
+__version__ = "0.5.0"

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.0
+Fits without the new option give the same results as 0.4.0.
+
+New:
+- `accelerate=True` (off by default) speeds up fits that converge slowly.
+  After the first plain steps at the final mu, each step is extrapolated from
+  the last five (Anderson acceleration); an extrapolated point that raises
+  the objective is discarded, and a stop is accepted only after three plain
+  steps confirm it. It switches on only when the plain steps still have a long
+  way to go, so fits that are about to stop are unchanged. The solution is the
+  same up to the tolerance. In our tests slow fits took 2-5 times fewer steps.
+  It uses about 15 more arrays the size of M, and has no effect with
+  `sigma=0`, `solver="apg"` or `svd="randomized"`. `accel_at_` is the
+  iteration where it started. `sigma="auto"` and `conformal` use it for their
+  fits too; with `sigma="auto"` the estimate can differ slightly from the
+  plain solver's.
+
 ## 0.4.0
 Fits with a numeric `sigma` give the same results as 0.3.0.
 

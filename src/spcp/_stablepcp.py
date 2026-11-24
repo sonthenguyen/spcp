@@ -53,9 +53,17 @@ independent, based on the references above.
 import warnings
 
 import numpy as np
+from scipy.linalg.blas import daxpy as _axpy
 from scipy.sparse.linalg import svds
 
 __all__ = ["StablePCP", "trim_rank"]
+
+# accelerate=True: the stopping estimate after extrapolated steps runs low
+# (measured: up to about 2x), so it is doubled before it is compared with tol
+_AA_SAFETY = 2.0
+# accelerate=True switches on only when plain steps are expected to need more
+# than this many further steps (below that, it costs more than it saves)
+_AA_MIN_STEPS = 10
 
 
 # ----------------------------------------------------------------------------
@@ -133,6 +141,7 @@ def _svt_gram(X, thr, cap):
     if not np.isfinite(w_max):
         return None
     if w_max <= thr * thr:
+        _svt_gram.nuc = 0.0
         return np.zeros_like(X), 0
     ratio = np.sqrt(w_max) / thr                # s_max / thr, no thr^2 underflow
     if np.finfo(float).eps * ratio * ratio > _GRAM_RTOL:
@@ -141,6 +150,7 @@ def _svt_gram(X, thr, cap):
     k = min(k, cap)
     V = V[:, -k:]                               # top-k eigenvectors
     s = np.sqrt(w[-k:])
+    _svt_gram.nuc = float(np.sum(s - thr))
     if k <= A.shape[1] // 2:
         L = (A @ V * (1.0 - thr / s)) @ V.T     # m x k intermediate (small k)
     else:
@@ -271,6 +281,19 @@ class StablePCP:
         recent contraction factor, so slow-converging problems are not
         stopped early. When L is much smaller than M, the relative error of
         L itself is larger than tol.
+    accelerate : bool, default False
+        Speed up fits that converge slowly. After the first few plain
+        block-coordinate steps at the final mu, each step is extrapolated from
+        the last five (Anderson acceleration). An extrapolated point that
+        raises the objective is discarded for the plain step, and a stop is
+        accepted only after three plain steps confirm it. It switches on only
+        when the plain steps still have a long way to go, so fits that are
+        about to stop are unchanged. The solution is the same up to the
+        tolerance. With sigma="auto" the estimate can differ slightly from
+        the plain solver's. Uses about 15 more arrays the size of M.
+        Has no effect with sigma=0, solver="apg" (or after solver="auto"
+        switches to it) or svd="randomized". `accel_at_` is the iteration
+        where it started (None if it did not).
     tol_scale : float, default 1.0
         Multiplies the tolerance chosen by tol="auto" (no effect with a
         numeric tol). Values above 1 stop sooner: for example 100 gives a
@@ -332,6 +355,8 @@ class StablePCP:
                                mu was given)
     sigma_path_ : list or None with sigma="auto": (value tried, value measured)
                                for each round
+    accel_at_ : int or None    iteration where accelerate=True started
+                               extrapolating (None if it did not)
     solution_ : (L, S)         the fit before debiasing (L_, S_ when
                                debias=False): pass it as `init` to warm-start
                                a fit of similar data
@@ -352,7 +377,7 @@ class StablePCP:
                  rsvd_n_iter=10, rsvd_oversample=10, rsvd_margin=5,
                  rsvd_init_ratio=0.2, polish_tol=1e-3,
                  debias=False, debias_iter=30, debias_rank_factor=None,
-                 debias_mask_factor=4.0, tol_scale=1.0):
+                 debias_mask_factor=4.0, tol_scale=1.0, accelerate=False):
         self.sigma = sigma
         self.lam_scale = lam_scale
         self.lam = lam
@@ -378,6 +403,7 @@ class StablePCP:
         self.debias_rank_factor = debias_rank_factor
         self.debias_mask_factor = debias_mask_factor
         self.tol_scale = tol_scale
+        self.accelerate = accelerate
 
     # ------------------------------------------------------------------
     def _check_params(self):
@@ -479,6 +505,7 @@ class StablePCP:
         self.errors_ = []
         self.converged_ = False
         self.switched_at_ = None
+        self.accel_at_ = None                      # accelerate does not apply here
         rank = 0
         for it in range(1, int(self.max_iter) + 1):
             if has_miss:
@@ -534,6 +561,7 @@ class StablePCP:
             out = _svt_gram(X, thr, cap)
             if out is not None:
                 self._n_gram += 1
+                self._nuc = _svt_gram.nuc
                 return out
             self._n_fallback += 1               # precision guard tripped
 
@@ -558,6 +586,7 @@ class StablePCP:
 
         r = min(int(np.sum(s > thr)), cap)
         self._k_pred = r + self.rsvd_margin
+        self._nuc = float(np.sum(s[:r] - thr))
         return (U[:, :r] * (s[:r] - thr)) @ Vt[:r], r
 
     # ------------------------------------------------------------------
@@ -659,6 +688,23 @@ class StablePCP:
         mode = "apg" if self.solver == "apg" else "bcd"
         if mode == "apg":
             L_prev, S_prev = np.zeros_like(M), np.zeros_like(M)
+        # Anderson acceleration of the block-coordinate map (accelerate=True):
+        # same fixed point, fewer steps. State W = what the low-rank step sees
+        # (M - S where observed, L where missing).
+        aa_on = bool(self.accelerate) and mode == "bcd" and not randomized
+        aa_mem = 5
+        aa_G, aa_F, aa_FF = [], [], np.zeros((0, 0))
+        aa_W = aa_Wp = None
+        aa_free = []
+        aa_phi, aa_cand, aa_t1, aa_t2 = np.inf, False, None, None
+        self.n_reject_ = 0
+        self.accel_at_ = None
+        aa_confirm, aa_plain, aa_wait, aa_pr = 0, False, False, []   # a stop is confirmed with plain steps
+        aa_floor_rate = 0.0
+        aa_ratio = None
+        aa_nf = np.inf
+        aa_rates = []
+        self.n_restart_ = 0
         self.switched_at_ = None
         self.errors_ = []
         self.converged_ = False
@@ -667,7 +713,125 @@ class StablePCP:
         n_floor = 0
 
         for it in range(1, int(self.max_iter) + 1):
-            if mode == "bcd":
+            if mode == "aa":
+                if aa_W is None:
+                    aa_W = M - S
+                    if has_miss:
+                        aa_mf = miss.astype(float)             # 1 where missing; multiplying is faster than masked copies
+                        aa_of = 1.0 - aa_mf
+                        aa_W += aa_mf * L                      # M and S are 0 where missing
+                L_new, rank_new = self._svt(aa_W, mu, randomized, polishing)
+                np.subtract(M, L_new, out=buf)
+                # Objective at L_new with its best S: mu ||L||_* + sum over the
+                # observed cells of h(M - L), h(x) = x^2/2 up to the cutoff c and
+                # c|x| - c^2/2 beyond. Plain steps never increase it, so an
+                # extrapolated point that does is discarded for the plain step.
+                if aa_t1 is None:
+                    aa_t1, aa_t2 = np.empty_like(M), np.empty_like(M)
+                np.abs(buf, out=aa_t1)
+                if has_miss:
+                    aa_t1 *= aa_of
+                np.minimum(aa_t1, lam * mu, out=aa_t2)
+                phi = mu * self._nuc + float(np.vdot(aa_t1, aa_t2)) - 0.5 * float(np.vdot(aa_t2, aa_t2))
+                if aa_cand and phi > aa_phi + 1e-12 * abs(aa_phi):
+                    np.copyto(aa_W, aa_G[-1])              # the plain step from the last accepted point
+                    aa_free.extend(aa_G); aa_free.extend(aa_F)
+                    aa_G, aa_F, aa_FF = [], [], np.zeros((0, 0))
+                    aa_free.append(aa_Wp)
+                    aa_Wp = None
+                    aa_cand, aa_plain = False, True
+                    self.n_reject_ += 1
+                    self.errors_.append(self.errors_[-1])
+                    continue
+                aa_phi = phi
+                rank = rank_new
+                d2 = _sqdist(L_new, L)
+                L = L_new
+                _soft(buf, lam * mu, out=buf)             # new S
+                if has_miss:
+                    buf *= aa_of
+                d2 += _sqdist(buf, S)
+                S, buf = buf, S
+                Gk = aa_free.pop() if aa_free else np.empty_like(M)
+                np.subtract(M, S, out=Gk)                  # the plain step from aa_W
+                if has_miss:
+                    np.multiply(L, aa_mf, out=aa_t2)
+                    Gk += aa_t2
+                if mu > mu_final_s:                        # continuation: plain steps
+                    aa_free.append(aa_W)
+                    aa_W = Gk
+                    aa_free.extend(aa_G); aa_free.extend(aa_F)
+                    aa_G, aa_F, aa_FF = [], [], np.zeros((0, 0))
+                    if aa_Wp is not None:
+                        aa_free.append(aa_Wp)
+                    aa_Wp = None
+                    aa_nf = np.inf
+                    aa_rates = []
+                    aa_res = np.inf
+                    aa_phi, aa_cand = np.inf, False
+                else:
+                    Fk = aa_free.pop() if aa_free else np.empty_like(M)
+                    np.subtract(Gk, aa_W, out=Fk)
+                    nf = float(np.sqrt(np.vdot(Fk, Fk)))
+                    aa_res = nf / normM
+                    # this point was a plain step from the last one: their step sizes give the plain rate
+                    aa_ratio = nf / aa_nf if (aa_plain and np.isfinite(aa_nf) and aa_nf > 0) else None
+                    if aa_ratio is None:
+                        aa_pr = []
+                    else:
+                        aa_pr.append(aa_ratio)
+                    if aa_Wp is not None and aa_G:         # how much the plain map contracted between the last two points
+                        dw = _sqdist(aa_W, aa_Wp)
+                        if dw > 0:
+                            aa_rates.append(float(np.sqrt(_sqdist(Gk, aa_G[-1]) / dw)))
+                    if aa_G and nf > aa_nf:                # no progress: forget the history
+                        aa_free.extend(aa_G); aa_free.extend(aa_F)
+                        aa_G, aa_F, aa_FF = [], [], np.zeros((0, 0))
+                        self.n_restart_ += 1
+                    aa_nf = nf
+                    if aa_Wp is not None:
+                        aa_free.append(aa_Wp)
+                    aa_Wp = aa_W
+                    aa_G.append(Gk)
+                    aa_F.append(Fk)
+                    if len(aa_G) > aa_mem + 1:
+                        aa_free.append(aa_G.pop(0))
+                        aa_free.append(aa_F.pop(0))
+                        aa_FF = aa_FF[1:, 1:]
+                    q = len(aa_F)
+                    new = np.array([float(np.vdot(Fk, f)) for f in aa_F])
+                    FF = np.empty((q, q))
+                    FF[:q - 1, :q - 1] = aa_FF
+                    FF[q - 1, :] = new
+                    FF[:, q - 1] = new
+                    aa_FF = FF
+                    aa_W = aa_free.pop() if aa_free else np.empty_like(M)
+                    g = None
+                    if q >= 2:
+                        # minimise || F_k - sum_j g_j (F_k - F_j) ||
+                        kk = FF[q - 1, q - 1]
+                        A = kk - FF[q - 1, :q - 1][None, :] - FF[:q - 1, q - 1][:, None] + FF[:q - 1, :q - 1]
+                        b = kk - FF[q - 1, :q - 1]
+                        A = A + 1e-10 * np.trace(A) * np.eye(q - 1)
+                        try:
+                            g = np.linalg.solve(A, b)
+                        except np.linalg.LinAlgError:
+                            g = None
+                        if g is not None and not np.all(np.isfinite(g)):
+                            g = None
+                    aa_plain = g is None or aa_confirm > 0
+                    aa_cand = not aa_plain
+                    aa_confirm = max(aa_confirm - 1, 0)
+                    if aa_plain:
+                        np.copyto(aa_W, Gk)
+                    else:
+                        np.multiply(Gk, 1.0 - g.sum(), out=aa_W)
+                        # flat views in the arrays' own memory order (all share M's layout):
+                        # a plain reshape(-1) copies a column-ordered array, losing the update
+                        wv = aa_W.reshape(-1, order="A")
+                        for gj, Gj in zip(g, aa_G[:-1]):
+                            _axpy(Gj.reshape(-1, order="A"), wv, a=float(gj))
+            elif mode == "bcd":
                 # exact minimisation over each block in turn
                 np.subtract(M, S, out=buf)
                 if has_miss:
@@ -734,7 +898,29 @@ class StablePCP:
             # iteration contracts by `rate` per step; using the raw change
             # alone stops too early when progress is slow.
             dist = np.inf
-            if mode == "bcd":
+            if mode == "aa":
+                # For a map that contracts by `rate`, the distance from the
+                # point where it was applied to the fixed point is at most
+                # (plain step size) / (1 - rate), however that point was made.
+                # The rate seen between accelerated points can be too low, so
+                # a stop is only accepted after three plain steps confirm it
+                # with the plain solver's own estimate:
+                # step size / (1 - largest ratio of successive plain steps).
+                if at_floor and aa_res == 0:
+                    dist = 0.0
+                elif at_floor and len(aa_pr) >= 3:
+                    rate = max(aa_pr[-3:])
+                    aa_floor_rate = max(aa_floor_rate, min(rate, 1.0))
+                    aa_wait = False
+                    if rate < 1.0:
+                        # after extrapolated steps this estimate runs low (measured: up
+                        # to about 2x), so it is doubled before it is compared with tol
+                        dist = _AA_SAFETY * aa_res / (1.0 - rate)
+                elif at_floor and not aa_wait and len(aa_rates) >= 3:
+                    rate = max(max(aa_rates[-3:]), aa_floor_rate)
+                    if rate < 1.0 and _AA_SAFETY * aa_res / (1.0 - rate) <= tol:
+                        aa_confirm, aa_wait = 3, True
+            elif mode == "bcd":
                 rate = np.inf
                 if len(self.errors_) >= 4 and self.errors_[-4] > 0:
                     ratios = [self.errors_[i] / self.errors_[i - 1]
@@ -763,6 +949,18 @@ class StablePCP:
                     n_floor = 0
                     if self.continuation:
                         mu = mu_init_s
+                # Not converged after the first few plain steps at the final
+                # mu: continue with accelerated steps (same fixed point).
+                # Only when plain steps still have a long way to go: on a fit that
+                # is about to stop, the extrapolation and its confirming plain
+                # steps cost more than they save.
+                if mode == "bcd" and aa_on and n_floor >= 5 and len(self.errors_) >= 6 and dist > tol:
+                    left = np.inf
+                    if 0.0 < rate < 1.0 and err > 0:
+                        left = np.log(tol * (1.0 - rate) / err) / np.log(rate)
+                    if left > _AA_MIN_STEPS:
+                        mode = "aa"
+                        self.accel_at_ = it
             else:
                 # momentum makes single steps noisy: average the rate over
                 # the last 10 residuals
@@ -794,7 +992,7 @@ class StablePCP:
                           f"lam_scale is probably too small (or sigma too "
                           f"small) for this data.")
         self.n_svd_fallback_ = self._n_fallback
-        del buf, L_prev, S_prev
+        del buf, L_prev, S_prev, aa_G, aa_F, aa_W, aa_Wp, aa_free
         self.debias_rank_ = None
         # solution before debiasing: a warm start for refits on similar data
         self.solution_ = (L * scale, S * scale) if self.debias else None

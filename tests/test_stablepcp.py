@@ -812,3 +812,87 @@ def test_sigma_auto_on_larger_noise_free_data_converges_every_round(monkeypatch)
     assert all(c["converged"] for c in calls)
     found = np.abs(mod.S_) > 1.0
     assert found[fg].mean() > 0.9 and found[~fg].mean() < 0.01
+
+
+# ---------------------------------------------------------------- accelerate=True
+def test_accelerate_off_by_default():
+    M = _ws_data()
+    a = StablePCP(sigma=1.0).fit(M)
+    b = StablePCP(sigma=1.0, accelerate=False).fit(M)
+    assert np.array_equal(a.L_, b.L_) and a.n_iter_ == b.n_iter_ and b.accel_at_ is None
+
+
+@pytest.mark.filterwarnings("ignore:.*classified as outliers")   # a deliberately slow setting
+def test_accelerate_same_answer_in_fewer_steps_on_a_slow_fit():
+    L0, S0, M = make_data(200, 200, 3, sigma=0.01)
+    kw = dict(sigma=0.01, lam_scale=0.5)
+    exact = StablePCP(tol=1e-11, max_iter=50000, **kw).fit(M)
+    plain = StablePCP(**kw).fit(M)
+    fast = StablePCP(accelerate=True, **kw).fit(M)
+    assert fast.converged_ and fast.accel_at_ is not None
+    assert fast.n_iter_ < plain.n_iter_ / 2
+    err = lambda m: np.sqrt(np.mean((m.L_ - exact.L_) ** 2))
+    assert err(fast) <= 2 * err(plain) and err(fast) < 1e-3 * 0.01       # far below the noise
+
+
+def test_accelerate_with_missing_values():
+    L0, S0, M, Mm, miss = _miss_data()
+    exact = StablePCP(sigma=1.0, tol=1e-11, max_iter=50000).fit(Mm)
+    plain = StablePCP(sigma=1.0).fit(Mm)
+    fast = StablePCP(sigma=1.0, accelerate=True).fit(Mm)
+    assert fast.converged_ and fast.n_iter_ < plain.n_iter_
+    err = lambda m: np.sqrt(np.mean((m.L_ - exact.L_) ** 2))
+    assert err(fast) <= 2 * err(plain)
+    assert np.all(fast.S_[miss] == 0) and np.all(np.isnan(fast.noise_[miss]))
+
+
+def test_accelerate_leaves_fits_that_are_about_to_stop_unchanged():
+    M = _ws_data()
+    base = StablePCP(sigma=1.0).fit(M)
+    Mb = M.copy(); Mb[10:14, 5] += 8.0
+    for X, init in ((M, None), (Mb, base.solution_)):          # a quick fit and a warm refit
+        a = StablePCP(sigma=1.0).fit(X, init=init)
+        b = StablePCP(sigma=1.0, accelerate=True).fit(X, init=init)
+        assert b.accel_at_ is None
+        assert np.array_equal(a.L_, b.L_) and a.n_iter_ == b.n_iter_
+
+
+def test_accelerate_has_no_effect_with_apg_randomized_or_sigma_zero():
+    M = make_data()[2]
+    X0 = make_data(60, 40, 2, sigma=0.0, seed=17)[2]
+    for X, kw in ((M, dict(sigma=0.1, solver="apg")),
+                  (M, dict(sigma=0.1, svd="randomized", random_state=0)),
+                  (X0, dict(sigma=0))):
+        a = StablePCP(**kw).fit(X)
+        b = StablePCP(accelerate=True, **kw).fit(X)
+        assert b.accel_at_ is None
+        assert np.array_equal(a.L_, b.L_) and a.n_iter_ == b.n_iter_
+
+
+@pytest.mark.filterwarnings("ignore:.*classified as outliers")   # a deliberately slow setting
+def test_accelerate_same_work_for_any_memory_layout():
+    # the extrapolation must not depend on whether the input is row- or column-ordered
+    L0, S0, M = make_data(200, 200, 3, sigma=0.01)
+    kw = dict(sigma=0.01, lam_scale=0.5, accelerate=True)
+    c = StablePCP(**kw).fit(np.ascontiguousarray(M))
+    f = StablePCP(**kw).fit(np.asfortranarray(M))
+    s = StablePCP(**kw).fit(np.asfortranarray(M)[:150])           # a column-ordered slice
+    r = StablePCP(**kw).fit(np.ascontiguousarray(M[:150]))
+    assert c.accel_at_ is not None and c.n_iter_ == f.n_iter_ and s.n_iter_ == r.n_iter_
+    np.testing.assert_allclose(c.L_, f.L_, atol=1e-10)
+
+
+def test_accelerate_is_used_by_the_sigma_search_and_conformal_refits(monkeypatch):
+    from spcp._stablepcp import _LOG_ABS_SD         # sigma of the noise-measuring fits
+    seen, orig = [], StablePCP.fit
+
+    def spy(self, M, init=None):
+        if self.sigma != _LOG_ABS_SD:
+            seen.append(self.accelerate)
+        return orig(self, M, init=init)
+    monkeypatch.setattr(StablePCP, "fit", spy)
+    M = _small_data()[2]
+    m = StablePCP(sigma="auto", accelerate=True).fit(M)
+    m.conformal([(slice(5, 8), 3)], n_cal=20, random_state=0)
+    assert len(seen) > 3 and all(seen)
+
