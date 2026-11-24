@@ -69,14 +69,12 @@ The other settings have defaults that rarely need changing. After fitting,
 the results are in `L_`, `S_`, `noise_` and `rank_`.
 [docs/guide.md](docs/guide.md) lists every option and result and describes
 each feature: reading S, trimming L, solvers, checking a fit, debiasing,
-missing values, warm starts and precision.
+missing values, warm starts, precision and intervals.
 
 ## Future work
 
 Planned, roughly in this order:
 
-- **Prediction intervals** for what the data would have been in chosen cells
-  (a counterfactual).
 - **Automatic noise level**: estimating `sigma` from the data, and an exact
   fit for data with no dense noise.
 - **A faster solver** for fits that converge slowly.

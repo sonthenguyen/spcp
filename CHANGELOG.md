@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.0
+No change to fits: `fit` gives the same results as 0.2.0.
+
+New:
+- `conformal(windows, level, ...)`: prediction intervals for what the data
+  would have been in chosen cells (a counterfactual). Fake events are planted
+  in other, held-out windows, the model is refitted, and its errors there set
+  the interval width (split conformal). It does not assume the low-rank model
+  is right. Costs about `n_cal / per_refit` extra fits, each warm-started. By
+  default the fake events copy the estimated effects of your events and are
+  placed in the same columns at other rows. `n_groups` calibrates separately
+  for windows of similar size, and `scale` makes windows of different size
+  comparable. If the windows are missing (NaN) in the fitted data, it hides
+  same-shaped observed windows instead and compares the filled-in values with
+  the real ones. Coverage is approximate: it assumes your windows behave like
+  the calibration windows.
+
 ## 0.2.0
 Two changes in behaviour:
 - `tol="auto"` is the new default. The fit stops when the remaining error is

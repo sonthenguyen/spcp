@@ -144,3 +144,38 @@ the size of M; `tol=1e-7` reproduces versions before 0.2.0.
 `tol_scale` multiplies the automatic tolerance. Above 1 gives a rougher,
 faster fit, which suits fits repeated many times from a warm start; below 1
 solves more precisely. `tol_` is the tolerance that was used.
+
+## Intervals, `conformal` (0.3.0)
+
+`conformal` answers "what would these cells have been without the event, and
+how sure is that?". Give it the cells of each event as index tuples:
+
+```python
+model = StablePCP(sigma=sigma, debias=True).fit(M)
+out = model.conformal([(slice(40, 44), 7)], level=0.9)
+out["estimate"], out["low"], out["high"]     # one value per window (its sum, by default)
+```
+
+It plants fake events in other windows of the same shape, refits, and uses
+its errors there as the width of the interval. It does not assume the
+low-rank model is right. The refits are warm-started; the cost is about
+`n_cal / per_refit` extra fits.
+
+- `candidates` says where the calibration windows go: the same columns at
+  other rows (the default, `"same_cols"`), the same rows at other columns
+  (`"same_rows"`), anywhere (`"random"`), or a list of your own.
+- `effect` says what is planted: by default the estimated effect of one of
+  your events; `"residual"` plants the full departure from L; `(low, high)`
+  plants a shift of that many noise levels.
+- `statistic(V, window)` replaces the sum with another quantity.
+- `scale(estimate)` divides the errors so windows of different size are
+  comparable, and `n_groups` calibrates separately for small and large
+  windows.
+
+If the windows were hidden (NaN) when the model was fitted, calibration hides
+other observed windows of the same shape and compares the filled-in values
+with the real ones. `candidates="same_rows"` is then the natural choice when
+rows are time and columns are units.
+
+Coverage is approximate: it assumes your windows behave like the calibration
+windows.

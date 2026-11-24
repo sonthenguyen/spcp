@@ -540,3 +540,80 @@ def test_missing_values_work_with_a_warm_start():
     warm = StablePCP(sigma=1.0).fit(Mm, init=cold.solution_)
     assert np.allclose(warm.L_, cold.L_, atol=1e-2) and warm.n_iter_ <= cold.n_iter_   # same to solver tolerance, far below sigma
     assert np.array_equal(warm.missing_, miss)
+
+
+# ---------------------------------------------------------------- intervals: conformal
+def _small_data(seed=0, m=60, n=50, r=2, sig=1.0):
+    rng = np.random.default_rng(seed)
+    L0 = rng.normal(size=(m, r)) @ rng.normal(size=(r, n)) * 3
+    S0 = np.where(rng.random((m, n)) < 0.05, 20.0, 0.0)
+    return L0, S0, L0 + S0 + rng.normal(0, sig, (m, n))
+
+
+def test_conformal_outputs_and_coverage():
+    rng = np.random.default_rng(0)
+    m, n = 120, 40
+    L0 = rng.normal(size=(m, 2)) @ rng.normal(size=(2, n)) * 3
+    M = L0 + rng.normal(0, 1, (m, n))
+    wins, truth = [], []
+    for k in range(30):
+        r0, j = 4 * k, k % n
+        w = (slice(r0, r0 + 4), j)
+        truth.append(M[w].sum())
+        wins.append(w)
+    Mp = M.copy()
+    for w in wins:
+        Mp[w] += 8.0
+    mod = StablePCP(sigma=1.0, debias=True).fit(Mp)
+    res = mod.conformal(wins, level=0.9, n_cal=120, per_refit=30, random_state=0)
+    assert res["estimate"].shape == (30,) and len(res["cal_errors"]) == 120
+    assert np.all(res["low"] <= res["high"])
+    cov = np.mean((np.array(truth) >= res["low"]) & (np.array(truth) <= res["high"]))
+    assert cov >= 0.75
+    with pytest.raises(ValueError):
+        mod.conformal(wins, level=2)
+
+
+def test_conformal_n_groups():
+    rng = np.random.default_rng(0)
+    m, n = 160, 40
+    M = np.abs(rng.normal(size=(m, 2)) @ rng.normal(size=(2, n))) * 5 + 10 + rng.normal(0, 1, (m, n))
+    wins = [(slice(4 * k, 4 * k + 4), k % n) for k in range(30)]
+    mod = StablePCP(sigma=1.0, debias=True).fit(M)
+    r = mod.conformal(wins, n_cal=180, per_refit=30, n_groups=3, scale=lambda c: max(c, 1), random_state=0)
+    assert r["low"].shape == (30,) and np.all(r["low"] <= r["high"])
+    assert len(r["cal_estimates"]) == 180
+    with pytest.raises(ValueError):
+        mod.conformal(wins, n_cal=40, per_refit=30, n_groups=3, random_state=0)
+
+
+def test_conformal_hidden_block():
+    rng = np.random.default_rng(3)
+    T, N = 160, 40
+    M0 = rng.normal(size=(T, 2)) @ rng.normal(size=(2, N)) * 2 + rng.normal(0, 1, (T, N))
+    Mm = M0.copy(); Mm[100:, 0] = np.nan                 # hide one unit's last 60 periods
+    m = StablePCP(sigma=1.0, debias=True).fit(Mm)
+    w = (slice(100, T), 0)
+    r = m.conformal([w], candidates="same_rows", n_cal=60,
+                    statistic=lambda V, ww: float(np.mean(V[ww])), random_state=0)
+    assert r["low"][0] < r["estimate"][0] < r["high"][0]
+    assert r["low"][0] <= M0[w].mean() <= r["high"][0]
+
+
+def test_conformal_mixed_hidden_and_observed_windows_raise():
+    L0, S0, M, Mm, miss = _miss_data()
+    m = StablePCP(sigma=1.0).fit(Mm)
+    r, c = np.argwhere(miss)[0]
+    r2, c2 = np.argwhere(~miss)[0]
+    with pytest.raises(ValueError, match="hidden"):
+        m.conformal([(r, c), (r2, c2)])
+
+
+def test_intervals_need_sigma_and_a_fit():
+    L0, S0, M = _small_data()
+    with pytest.raises(RuntimeError, match="not fitted"):
+        StablePCP(sigma=1.0).conformal([(0, 0)])
+    m = StablePCP(mu=10.0, lam=0.1, tol=1e-6).fit(M)            # mu given directly, no sigma
+    with pytest.raises(ValueError, match="sigma"):
+        m.conformal([(0, 0)])
+
