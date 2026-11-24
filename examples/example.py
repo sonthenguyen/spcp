@@ -20,6 +20,24 @@ L_lean, r = model.trimmed_low_rank()
 print(f"converged in {model.n_iter_} iterations")
 print(f"rank of L: {model.rank_} (after trimming noise components: {r})")
 print(f"error in L: {np.linalg.norm(L_lean - L_true) / np.linalg.norm(L_true):.3%}")
-found = (S != 0) & outliers
-print(f"outliers found: {found.sum()} of {outliers.sum()}, "
-      f"false flags: {((S != 0) & ~outliers).sum()}")
+# S also holds many small, noise-sized values (see docs/guide.md, "Reading S"):
+# count the clear outliers, those larger than three noise levels
+clear = np.abs(S) > 3 * sigma
+planted = np.abs(S_true) > 3 * sigma
+print(f"clear outliers found: {(clear & planted).sum()} of {planted.sum()}, "
+      f"false ones: {(clear & ~outliers).sum()}")
+print(f"small noise-sized values in S: {((S != 0) & ~clear).sum()} "
+      f"of {S.size} entries (expected, see the guide)")
+
+# Undo the shrinkage of L when its values matter
+deb = StablePCP(sigma=sigma, debias=True).fit(M)
+print(f"error in L with debias=True: "
+      f"{np.linalg.norm(deb.L_ - L_true) / np.linalg.norm(L_true):.3%}")
+
+# Missing values: hide a block of cells and read the model's values for them
+M_hidden = M.copy()
+M_hidden[:20, :10] = np.nan
+filled = StablePCP(sigma=sigma, debias=True).fit(M_hidden, init=deb.solution_)   # warm start
+err = np.sqrt(np.mean((filled.L_[:20, :10] - L_true[:20, :10]) ** 2))
+print(f"hidden block: typical error of the filled-in values {err:.3f} "
+      f"(noise level {sigma}), refit took {filled.n_iter_} iterations")

@@ -4,14 +4,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spcp"
-version = "0.1.1"
+version = "0.2.0"
 description = "Stable Principal Component Pursuit: split a matrix into low-rank + sparse outliers + dense noise"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "sonthenguyen" }]
 requires-python = ">=3.9"
-dependencies = ["numpy>=1.21", "scipy>=1.8"]
+dependencies = [
+    "numpy>=1.21",
+    # first numpy with ready-made wheels for each newer Python; below them pip
+    # compiles numpy, usually without a fast linear-algebra library (~20x slower)
+    "numpy>=1.23.2; python_version >= '3.11'",
+    "numpy>=1.26; python_version >= '3.12'",
+    "numpy>=2.1; python_version >= '3.13'",
+    "numpy>=2.3.2; python_version >= '3.14'",
+    "scipy>=1.8",
+]
 keywords = ["robust pca", "stable pcp", "low-rank", "outlier detection", "matrix decomposition"]
 classifiers = [
     "Programming Language :: Python :: 3",
