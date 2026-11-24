@@ -22,7 +22,8 @@ version introduced the feature; CHANGELOG.md lists changes by version.
 
 After fitting: `L_`, `S_`, `noise_`, `rank_`, `n_iter_`, `converged_`,
 `sparse_fraction_`, `switched_at_`, `debias_rank_`, `solution_`, `missing_`,
-`tol_`, `lam_`, `mu_`. The docstrings have the full list.
+`tol_`, `sigma_`, `sigma_path_`, `lam_`, `mu_`. The docstrings have the full
+list.
 
 ## Reading S (0.1.0)
 
@@ -179,3 +180,28 @@ rows are time and columns are units.
 
 Coverage is approximate: it assumes your windows behave like the calibration
 windows.
+
+## Noise level, `sigma="auto"` and `sigma=0` (0.4.0)
+
+A noise level you know is the best choice. When you have none,
+`sigma="auto"` estimates it from the data:
+
+```python
+model = StablePCP(sigma="auto").fit(M)
+model.sigma_          # the value used
+model.sigma_path_     # each round: (value tried, value measured)
+```
+
+It looks for the value at which a fit leaves a residual with that same
+typical noise level. Each round is a fit of the data plus a fit of its
+residuals, so it costs several extra fits. More data gives a more accurate
+estimate. It follows the typical size of the noise, so occasional large
+spikes in the noise do not raise it. `conformal` reuses the estimate.
+
+`sigma=0` is for data with no dense noise, where most values repeat exactly
+(compressed video, for example). The model becomes M = L + S exactly on the
+observed entries (principal component pursuit), with no setting to choose.
+`sigma="auto"` recognises this case and switches to it. With `sigma=0`,
+`debias` does not apply and `conformal` cannot plant shifts given in units of
+sigma (`effect=(low, high)`).
+
