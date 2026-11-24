@@ -98,6 +98,8 @@ def test_errors():
     with pytest.raises(ValueError):
         StablePCP(sigma=-1).fit(M)
     with pytest.raises(ValueError):
+        StablePCP(sigma=0).fit(M)
+    with pytest.raises(ValueError):
         StablePCP(sigma=1).fit(np.ones(5))
     with pytest.raises(ValueError):
         StablePCP(sigma=1, svd="fast").fit(M)
@@ -110,10 +112,12 @@ def test_input_not_modified():
     assert np.array_equal(M, M_copy)
 
 
-def test_rejects_nan():
-    M = np.ones((5, 5)); M[0, 0] = np.nan
-    with pytest.raises(ValueError, match="missing"):
+def test_rejects_inf_and_all_missing():
+    M = np.ones((5, 5)); M[0, 0] = np.inf
+    with pytest.raises(ValueError, match="inf"):
         StablePCP(sigma=1).fit(M)
+    with pytest.raises(ValueError, match="observed"):
+        StablePCP(sigma=1).fit(np.full((5, 5), np.nan))
 
 
 def test_trim_rank():
@@ -255,7 +259,6 @@ def test_no_sparse_warning_on_normal_data():
     assert m.sparse_fraction_ < 0.2
 
 
-
 def toy_data(seed=123):
     rng = np.random.default_rng(seed)
     L = np.ones((50, 50)) * rng.integers(0, 10, size=50)
@@ -307,8 +310,8 @@ def test_apg_with_randomized_svd():
 
 def test_apg_without_continuation():
     L0, S0, M = make_data()
-    a = StablePCP(sigma=0.1).fit(M)
-    b = StablePCP(sigma=0.1, solver="apg", continuation=False, max_iter=20000).fit(M)
+    a = StablePCP(sigma=0.1, tol=1e-9).fit(M)
+    b = StablePCP(sigma=0.1, solver="apg", continuation=False, max_iter=20000, tol=1e-9).fit(M)
     assert b.converged_
     assert np.linalg.norm(b.L_ - a.L_) / np.linalg.norm(M) < 1e-6
 
@@ -316,8 +319,8 @@ def test_apg_without_continuation():
 def test_max_rank_solvers_agree():
     L0, S0, M = toy_data()
     M = M + np.random.default_rng(0).normal(0, 1, M.shape)
-    a = StablePCP(sigma=1.0, max_rank=2, solver="bcd").fit(M)
-    b = StablePCP(sigma=1.0, max_rank=2, solver="apg").fit(M)
+    a = StablePCP(sigma=1.0, max_rank=2, solver="bcd", tol=1e-9).fit(M)
+    b = StablePCP(sigma=1.0, max_rank=2, solver="apg", tol=1e-9).fit(M)
     assert a.rank_ <= 2 and b.rank_ <= 2
     assert np.linalg.norm(a.L_ - b.L_) / np.linalg.norm(M) < 1e-6
 
@@ -345,3 +348,195 @@ def test_row_blocks_do_not_change_results(monkeypatch, solver, shape):
     assert np.allclose(a.L_, b.L_, rtol=0, atol=1e-10)
     assert np.allclose(a.S_, b.S_, rtol=0, atol=1e-10)
     assert np.allclose(a.noise_, M - a.L_ - a.S_, atol=1e-10)
+
+
+# ----------------------------------------------------------------- debias
+def test_debias_off_by_default_and_unchanged():
+    import importlib.util
+    L0, S0, M = make_data()
+    m = StablePCP(sigma=0.1).fit(M)
+    assert m.debias is False and m.debias_rank_ is None
+    m2 = StablePCP(sigma=0.1, debias=False).fit(M)
+    assert np.array_equal(m.L_, m2.L_) and np.array_equal(m.S_, m2.S_)
+
+
+def test_debias_recovers_rank_and_improves_L():
+    L0, S0, M = make_data()
+    a = StablePCP(sigma=0.1).fit(M)
+    b = StablePCP(sigma=0.1, debias=True).fit(M)
+    assert b.debias_rank_ == 5 and b.rank_ == 5
+    assert rel(b.L_, L0) < rel(a.L_, L0)
+    assert np.allclose(b.noise_, M - b.L_ - b.S_)
+
+
+def busy_area_counts(seed=3):
+    # hourly counts for 30 areas with two rhythms; area 0 is far busier ("airport")
+    rng = np.random.default_rng(seed)
+    t = np.arange(1000)
+    P = np.column_stack([1 + 0.8 * np.sin(2 * np.pi * t / 24), 1 + 0.6 * np.sin(2 * np.pi * t / 168)])
+    W = rng.uniform(1, 8, (30, 2))
+    W[0] = [120, 60]
+    rate = P @ W.T
+    C = rng.poisson(rate).astype(float)
+    return 2 * np.sqrt(rate + 3 / 8), 2 * np.sqrt(C + 3 / 8)
+
+
+def test_debias_removes_false_outliers_in_busy_column():
+    X_true, X = busy_area_counts()
+    a = StablePCP(sigma=1.0).fit(X)
+    b = StablePCP(sigma=1.0, debias=True).fit(X)
+    assert b.debias_rank_ == 2
+    assert np.mean(b.S_[:, 0] != 0) < np.mean(a.S_[:, 0] != 0) - 0.05
+    assert rel(b.L_, X_true) < rel(a.L_, X_true)
+
+
+def test_debias_keeps_real_outliers():
+    L0, S0, M = make_data()
+    b = StablePCP(sigma=0.1, debias=True).fit(M)
+    big = np.abs(S0) > 5
+    assert np.mean(b.S_[big] != 0) > 0.95
+
+
+def test_debias_respects_max_rank_and_validation():
+    L0, S0, M = make_data()
+    b = StablePCP(sigma=0.1, debias=True, max_rank=3, max_iter=3000).fit(M)
+    assert b.rank_ <= 3
+    for kw in [dict(debias_iter=0), dict(debias_rank_factor=-1), dict(debias_mask_factor=-1)]:
+        with pytest.raises(ValueError):
+            StablePCP(sigma=0.1, debias=True, **kw).fit(M)
+
+
+@pytest.mark.parametrize("scale", [1e-100, 1e100])
+def test_debias_scale_invariant(scale):
+    L0, S0, M = make_data(60, 40, 2)
+    a = StablePCP(sigma=0.1, debias=True).fit(M)
+    b = StablePCP(sigma=0.1 * scale, debias=True).fit(M * scale)
+    assert rel(b.L_ / scale, a.L_) < 1e-8
+
+
+def test_debias_mask_all_option_runs_and_differs():
+    L0, S0, M = make_data()
+    a = StablePCP(sigma=0.1, debias=True).fit(M)
+    b = StablePCP(sigma=0.1, debias=True, debias_mask_factor=0).fit(M)
+    assert b.debias_rank_ == a.debias_rank_ == 5
+    assert rel(b.L_, L0) < 0.03 and not np.array_equal(a.L_, b.L_)
+
+
+# ---------------------------------------------------------------- tol="auto", warm start
+def _ws_data(seed=0, sig=1.0):
+    rng = np.random.default_rng(seed)
+    L = rng.normal(size=(300, 3)) @ rng.normal(size=(3, 80)) * 3
+    S = np.where(rng.random((300, 80)) < 0.05, 20.0, 0.0)
+    return L + S + rng.normal(0, sig, (300, 80))
+
+
+def test_tol_auto_close_to_tight_solution():
+    M = _ws_data()
+    ref = StablePCP(sigma=1.0, tol=1e-10, max_iter=20000).fit(M)
+    a = StablePCP(sigma=1.0, tol="auto").fit(M)
+    assert a.converged_ and a.tol_ > 1e-7
+    assert np.sqrt(np.mean((a.L_ - ref.L_) ** 2)) < 1e-2          # << sigma
+    with pytest.raises(ValueError):
+        StablePCP(sigma=1.0, tol="fast").fit(M)
+
+
+def test_warm_start_same_answer_fewer_iterations():
+    M = _ws_data()
+    base = StablePCP(sigma=1.0, debias=True).fit(M)
+    Mb = M.copy(); Mb[10:14, 5] += 8.0
+    cold = StablePCP(sigma=1.0, debias=True).fit(Mb)
+    warm = StablePCP(sigma=1.0, debias=True).fit(Mb, init=base.solution_)
+    assert np.allclose(warm.L_, cold.L_, atol=1e-5)
+    assert warm.n_iter_ <= cold.n_iter_
+    with pytest.raises(ValueError):
+        StablePCP(sigma=1.0).fit(Mb, init=(np.zeros((2, 2)), np.zeros((2, 2))))
+
+
+def test_tol_scale_trades_precision_for_speed():
+    M = _ws_data()
+    ref = StablePCP(sigma=1.0, tol=1e-10, max_iter=20000).fit(M)
+    base = StablePCP(sigma=1.0).fit(M)
+    rough = StablePCP(sigma=1.0, tol_scale=100.0).fit(M)
+    fine = StablePCP(sigma=1.0, tol_scale=0.01).fit(M)
+    assert rough.tol_ == pytest.approx(100.0 * base.tol_) and fine.tol_ == pytest.approx(0.01 * base.tol_)
+    assert rough.n_iter_ < base.n_iter_ < fine.n_iter_
+    assert rough.converged_ and fine.converged_
+    err = lambda m: np.sqrt(np.mean((m.L_ - ref.L_) ** 2))
+    assert err(fine) < err(base) < err(rough) < 0.5            # the rough fit is still well below sigma
+
+
+def test_tol_scale_default_floor_and_validation():
+    M = _ws_data()
+    a = StablePCP(sigma=1.0).fit(M)
+    b = StablePCP(sigma=1.0, tol_scale=1.0).fit(M)
+    assert np.array_equal(a.L_, b.L_) and a.n_iter_ == b.n_iter_
+    assert StablePCP(sigma=1.0, tol_scale=1e-12, max_iter=50).fit(M).tol_ == 1e-7   # never below the floor
+    c = StablePCP(sigma=1.0, tol=1e-5, tol_scale=100.0).fit(M)                      # no effect on a numeric tol
+    assert c.tol_ == 1e-5
+    for bad in (0, -1.0):
+        with pytest.raises(ValueError, match="tol_scale"):
+            StablePCP(sigma=1.0, tol_scale=bad).fit(M)
+
+
+def test_rough_warm_started_refit_follows_changed_data():
+    M = _ws_data()
+    base = StablePCP(sigma=1.0).fit(M)
+    Mb = M.copy(); Mb[10:14, 5] += 8.0
+    exact = StablePCP(sigma=1.0).fit(Mb)
+    quick = StablePCP(sigma=1.0, tol_scale=100.0).fit(Mb, init=base.solution_)
+    assert quick.n_iter_ < exact.n_iter_
+    assert np.sqrt(np.mean((quick.L_ - exact.L_) ** 2)) < 0.05
+
+
+def test_solution_is_raw_fit_when_debiased():
+    M = _ws_data()
+    plain = StablePCP(sigma=1.0).fit(M)
+    deb = StablePCP(sigma=1.0, debias=True).fit(M)
+    assert np.allclose(deb.solution_[0], plain.L_)
+    assert plain.solution_[0] is plain.L_
+
+
+# ---------------------------------------------------------------- missing values
+def _miss_data(seed=0, frac=0.3, outliers=0.0):
+    rng = np.random.default_rng(seed)
+    L0 = rng.normal(size=(200, 3)) @ rng.normal(size=(3, 60)) * 3
+    S0 = np.where(rng.random(L0.shape) < outliers, 25.0, 0.0)
+    M = L0 + S0 + rng.normal(0, 1, L0.shape)
+    miss = rng.random(L0.shape) < frac
+    Mm = M.copy(); Mm[miss] = np.nan
+    return L0, S0, M, Mm, miss
+
+
+def test_missing_cells_are_filled_from_L():
+    for outliers in (0.0, 0.05):
+        L0, S0, M, Mm, miss = _miss_data(outliers=outliers)
+        m = StablePCP(sigma=1.0, debias=True).fit(Mm)
+        rmse_missing = np.sqrt(np.mean((m.L_[miss] - L0[miss]) ** 2))
+        assert rmse_missing < 0.6                       # well below the noise (1.0)
+        assert np.all(m.S_[miss] == 0) and np.all(np.isnan(m.noise_[miss]))
+        assert np.all(np.isfinite(m.noise_[~miss]))
+        if outliers:
+            assert np.mean(m.S_[(S0 != 0) & ~miss] != 0) > 0.95
+
+
+def test_missing_input_not_modified_and_no_nan_unchanged():
+    L0, S0, M, Mm, miss = _miss_data()
+    before = Mm.copy()
+    StablePCP(sigma=1.0).fit(Mm)
+    assert np.array_equal(np.isnan(Mm), np.isnan(before))
+    a = StablePCP(sigma=1.0).fit(M)
+    assert a.missing_ is None
+
+
+def test_missing_apg_raises():
+    L0, S0, M, Mm, miss = _miss_data()
+    with pytest.raises(ValueError, match="solver"):
+        StablePCP(sigma=1.0, solver="apg").fit(Mm)
+
+
+def test_missing_values_work_with_a_warm_start():
+    L0, S0, M, Mm, miss = _miss_data()
+    cold = StablePCP(sigma=1.0).fit(Mm)
+    warm = StablePCP(sigma=1.0).fit(Mm, init=cold.solution_)
+    assert np.allclose(warm.L_, cold.L_, atol=1e-2) and warm.n_iter_ <= cold.n_iter_   # same to solver tolerance, far below sigma
+    assert np.array_equal(warm.missing_, miss)

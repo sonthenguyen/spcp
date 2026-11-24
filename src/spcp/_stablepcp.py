@@ -148,6 +148,18 @@ def _svt_gram(X, thr, cap):
     return (L if tall else L.T), k
 
 
+def _rank_r(X, r):
+    """Best rank-r approximation of X (no shrinkage), via the smaller Gram matrix."""
+    tall = X.shape[0] >= X.shape[1]
+    A = X if tall else X.T
+    if r <= 0:
+        return np.zeros_like(X)
+    w, V = np.linalg.eigh(A.T @ A)
+    V = V[:, -r:]
+    L = (A @ V) @ V.T
+    return L if tall else L.T
+
+
 def _spectral_norm(X):
     """Largest singular value via the smaller Gram matrix (eigenvalues only).
     Used only for the continuation start value, so Gram precision is ample."""
@@ -228,13 +240,24 @@ class StablePCP:
         of L is small relative to min(M.shape), e.g. with a large sigma or
         max_rank. With the sigma-based threshold, part of the noise-level
         components usually survive, so "auto" is usually faster.
-    tol : float, default 1e-7
+    tol : "auto" or float, default "auto"
+        "auto" stops when the remaining error is about 1/5000 of the total
+        noise (sigma * sqrt(m n)): noisy data stops sooner, precise data is
+        solved more precisely, down to 1e-7. In tests the solver's error
+        stayed below about 1% of the estimation error of L. Needs sigma (or mu); with lam and mu
+        given directly, sigma is taken from mu. A number:
         Stop when the estimated distance of (L, S) to the solution, relative
         to ||M||_F, falls below tol, once mu has reached its final value.
         The distance is estimated as change / (1 - rate), with `rate` the
         recent contraction factor, so slow-converging problems are not
         stopped early. When L is much smaller than M, the relative error of
         L itself is larger than tol.
+    tol_scale : float, default 1.0
+        Multiplies the tolerance chosen by tol="auto" (no effect with a
+        numeric tol). Values above 1 stop sooner: for example 100 gives a
+        rougher, faster fit, useful when a fit is repeated many times from a
+        warm start and only needs to follow the data. Values below 1 solve
+        more precisely. The tolerance never goes below 1e-7.
     max_iter : int, default 10000
         Most problems converge well before this limit. Settings where most
         entries end up in S (lam_scale far too small for the data) converge
@@ -242,6 +265,30 @@ class StablePCP:
     random_state : int or None
         Seed for the randomized SVD.
     verbose : bool, default False
+    debias : bool, default False
+        Undo the shrinkage that Stable PCP applies to L. The fit keeps its
+        decisions (how many components, which entries are outliers) but L is
+        refitted at full strength, ignoring the outlier entries, and S is
+        recomputed. Useful when the values of L or S matter (effect sizes,
+        counterfactuals, cleaned data): without it, L is biased toward zero,
+        most at the largest values, and that bias can appear in S as false
+        outliers. Note: the refit is not part of the convex problem.
+    debias_iter : int, default 30
+        Maximum refit rounds (stops early once the outlier set is stable).
+    debias_mask_factor : float, default 4.0
+        During debiasing, outliers larger than debias_mask_factor x sigma
+        (beyond the cutoff) are ignored when refitting L. The default masks
+        only clear outliers and gave the most accurate L and the fewest false
+        outliers in our tests. Use 0 (mask every flagged entry) when you need
+        the *size of moderate events*, e.g. the effect of street closures on
+        quiet areas: it estimated such effects much better in our tests, at
+        the cost of keeping some false outliers in the busiest rows/columns.
+    debias_rank_factor : float or None, default None
+        Components of the Stable PCP solution with singular value above
+        debias_rank_factor * mu_ are kept. None chooses it from the matrix
+        shape: just above the largest value pure noise can reach after
+        shrinkage (about 0.5 for square matrices, 0 for tall or wide ones,
+        where noise does not survive). Assumes sigma matches the noise.
     rsvd_n_iter, rsvd_oversample, rsvd_margin, rsvd_init_ratio, polish_tol
         Tuning for svd="randomized" only: power iterations, extra samples,
         rank margin, initial rank guess (fraction of min(M.shape)), and the
@@ -260,15 +307,23 @@ class StablePCP:
     n_svd_fallback_ : int      iterations where svd='auto' fell back to LAPACK
     switched_at_ : int or None iteration where solver='auto' switched to APG
     lam_, mu_, mu_init_ : float  parameters actually used
+    tol_ : float               stopping tolerance actually used
+    solution_ : (L, S)         the fit before debiasing (L_, S_ when
+                               debias=False): pass it as `init` to warm-start
+                               a fit of similar data
+    missing_ : ndarray or None boolean mask of the missing (NaN) entries
+    debias_rank_ : int or None rank kept by debias (None if debias=False)
     """
 
     def __init__(self, sigma=None, lam_scale=1.0, lam=None, mu=None,
                  continuation=True, eta=0.5, max_rank=None, svd="auto",
                  solver="auto", eta_apg=0.9, switch_rate=0.995,
-                 tol=1e-7, max_iter=10000, random_state=None, verbose=False,
+                 tol="auto", max_iter=10000, random_state=None, verbose=False,
                  # randomized-SVD tuning (rarely needed)
                  rsvd_n_iter=10, rsvd_oversample=10, rsvd_margin=5,
-                 rsvd_init_ratio=0.2, polish_tol=1e-3):
+                 rsvd_init_ratio=0.2, polish_tol=1e-3,
+                 debias=False, debias_iter=30, debias_rank_factor=None,
+                 debias_mask_factor=4.0, tol_scale=1.0):
         self.sigma = sigma
         self.lam_scale = lam_scale
         self.lam = lam
@@ -289,6 +344,11 @@ class StablePCP:
         self.rsvd_margin = rsvd_margin
         self.rsvd_init_ratio = rsvd_init_ratio
         self.polish_tol = polish_tol
+        self.debias = debias
+        self.debias_iter = debias_iter
+        self.debias_rank_factor = debias_rank_factor
+        self.debias_mask_factor = debias_mask_factor
+        self.tol_scale = tol_scale
 
     # ------------------------------------------------------------------
     def _check_params(self):
@@ -319,8 +379,15 @@ class StablePCP:
             raise ValueError("max_rank must be a positive integer")
         if int(self.max_iter) < 1:
             raise ValueError("max_iter must be >= 1")
-        if not self.tol >= 0:
+        if isinstance(self.tol, str):
+            if self.tol != "auto":
+                raise ValueError("tol must be a number >= 0 or 'auto'")
+            if self.sigma is None and self.mu is None:
+                raise ValueError("tol='auto' needs sigma (or mu)")
+        elif not self.tol >= 0:
             raise ValueError("tol must be >= 0")
+        if not self.tol_scale > 0:
+            raise ValueError("tol_scale must be > 0")
         if not self.polish_tol > 0:
             raise ValueError("polish_tol must be > 0")
         if int(self.rsvd_n_iter) < 0 or int(self.rsvd_oversample) < 0 \
@@ -329,6 +396,12 @@ class StablePCP:
                              "must be >= 0")
         if not 0 < self.rsvd_init_ratio <= 1:
             raise ValueError("rsvd_init_ratio must be in (0, 1]")
+        if int(self.debias_iter) < 1:
+            raise ValueError("debias_iter must be >= 1")
+        if self.debias_rank_factor is not None and not self.debias_rank_factor >= 0:
+            raise ValueError("debias_rank_factor must be >= 0 or None")
+        if not self.debias_mask_factor >= 0:
+            raise ValueError("debias_mask_factor must be >= 0")
 
     # ------------------------------------------------------------------
     def _svt(self, X, thr, randomized, accurate):
@@ -367,23 +440,45 @@ class StablePCP:
         return (U[:, :r] * (s[:r] - thr)) @ Vt[:r], r
 
     # ------------------------------------------------------------------
-    def fit(self, M):
-        """Decompose M (2-D array, all entries finite)."""
+    def fit(self, M, init=None):
+        """Decompose M (2-D array). NaN entries are treated as missing.
+
+        Missing entries are not fitted: L fills them in (its values there are
+        the model's estimate), S is zero there and noise_ is NaN. Use this to
+        hide cells, e.g. a treated unit's period after an intervention, so
+        that L gives their counterfactual. Missing values need the
+        block-coordinate solver (solver="auto" or "bcd").
+
+        init : (L, S), optional
+            Warm start, e.g. a previous solution for nearly the same data.
+            Continuation is skipped (the solver starts at the final mu), so
+            this only helps when the start is close to the answer.
+        """
         self._check_params()
         M = np.array(M, dtype=float)              # copy; never modify input
         if M.ndim != 2:
             raise ValueError("M must be 2-D")
         if M.size == 0:
             raise ValueError("M is empty")
-        if not np.isfinite(M).all():
-            raise ValueError("M contains NaN or inf (missing values are not "
-                             "supported in this version)")
+        if np.isinf(M).any():
+            raise ValueError("M contains inf")
+        miss = np.isnan(M)
+        has_miss = bool(miss.any())
+        if has_miss:
+            if miss.all():
+                raise ValueError("M has no observed entries")
+            if self.solver == "apg":
+                raise ValueError("missing values need solver='auto' or 'bcd'")
+        sigma = self.sigma
+        if has_miss:
+            M[miss] = 0.0
+        self.missing_ = miss if has_miss else None
 
         m, n = M.shape
         n_max = max(m, n)
-        mu_final = self.mu if self.mu is not None else \
-            np.sqrt(2.0 * n_max) * self.sigma
         lam = self.lam if self.lam is not None else self.lam_scale / np.sqrt(n_max)
+        mu_final = self.mu if self.mu is not None else \
+            np.sqrt(2.0 * n_max) * sigma
 
         # Work on M / scale (largest |entry| = 1). The problem is scale-
         # equivariant (M -> cM, mu -> c mu gives L -> cL, S -> cS), so this
@@ -394,7 +489,7 @@ class StablePCP:
             scale = 1.0
         M /= scale
         mu_final_s = mu_final / scale
-        if self.continuation:
+        if self.continuation and init is None:
             mu_init_s = max(0.99 * _spectral_norm(M), mu_final_s)
         else:
             mu_init_s = mu_final_s
@@ -407,11 +502,27 @@ class StablePCP:
         self._n_gram = self._n_fallback = 0
 
         normM = max(np.linalg.norm(M), np.finfo(float).tiny)
+        if isinstance(self.tol, str):
+            # "auto": stop when the remaining error is about 1/5000 of the
+            # total noise, sigma * sqrt(m n) (relative to ||M||)
+            noise_norm = (mu_final_s / np.sqrt(2.0 * n_max)) * np.sqrt(m * n)
+            # never stricter than 1e-7: for nearly noise-free data extra
+            # precision costs time and changes nothing
+            tol = max(self.tol_scale * noise_norm / 5000.0 / normM, 1e-7)
+        else:
+            tol = self.tol
+        self.tol_ = tol
         # Arrays kept between steps: M, L, S and one work buffer (plus the
         # two previous iterates in APG mode). Each step overwrites them in
         # place; only the new L from the SVT is freshly allocated.
-        L = np.zeros_like(M)
-        S = np.zeros_like(M)
+        if init is not None:
+            L = np.array(init[0], dtype=float) / scale
+            S = np.array(init[1], dtype=float) / scale
+            if L.shape != M.shape or S.shape != M.shape:
+                raise ValueError("init must be (L, S) with the shape of M")
+        else:
+            L = np.zeros_like(M)
+            S = np.zeros_like(M)
         buf = np.empty_like(M)
         L_prev = S_prev = None
         t_prev = t = 1.0
@@ -430,11 +541,15 @@ class StablePCP:
             if mode == "bcd":
                 # exact minimisation over each block in turn
                 np.subtract(M, S, out=buf)
+                if has_miss:
+                    np.copyto(buf, L, where=miss)          # fill from L (soft-impute)
                 L_new, rank = self._svt(buf, mu, randomized, polishing)
                 d2 = _sqdist(L_new, L)
                 L = L_new
                 np.subtract(M, L, out=buf)
                 _soft(buf, lam * mu, out=buf)             # new S
+                if has_miss:
+                    np.copyto(buf, 0.0, where=miss)        # no outliers where unobserved
                 d2 += _sqdist(buf, S)
                 S, buf = buf, S
             else:
@@ -505,8 +620,9 @@ class StablePCP:
                 # compared with the outliers). Detect it from the contraction
                 # rate after a few steps at the final mu, then switch to the
                 # accelerated method with its own (slower) continuation.
-                if (self.solver == "auto" and n_floor >= 5 and len(self.errors_) >= 6
-                        and dist > self.tol
+                if (self.solver == "auto" and not has_miss and n_floor >= 5
+                        and len(self.errors_) >= 6
+                        and dist > tol
                         and np.median(np.array(self.errors_[-5:]) /
                                       np.maximum(self.errors_[-6:-1], 1e-300))
                         > self.switch_rate):
@@ -531,7 +647,7 @@ class StablePCP:
 
             if randomized and not polishing and at_floor and err <= self.polish_tol:
                 polishing = True
-            if at_floor and dist <= self.tol and (polishing or not randomized):
+            if at_floor and dist <= tol and (polishing or not randomized):
                 self.converged_ = True
                 break
 
@@ -539,7 +655,7 @@ class StablePCP:
         if not self.converged_:
             warnings.warn(f"StablePCP did not converge in {self.max_iter} "
                           f"iterations (estimated distance {dist:.2e} > tol "
-                          f"{self.tol:.1e}). Increase max_iter.")
+                          f"{tol:.1e}). Increase max_iter.")
 
         frac_s = np.count_nonzero(S) / S.size
         self.sparse_fraction_ = frac_s
@@ -550,14 +666,78 @@ class StablePCP:
                           f"small) for this data.")
         self.n_svd_fallback_ = self._n_fallback
         del buf, L_prev, S_prev
+        self.debias_rank_ = None
+        # solution before debiasing: a warm start for refits on similar data
+        self.solution_ = (L * scale, S * scale) if self.debias else None
+        if self.debias:
+            L, S, rank = self._debias(M, L, S, lam * mu_final_s, mu_final_s, rank,
+                                      miss if has_miss else None)
+            frac_s = np.count_nonzero(S) / S.size
+            self.sparse_fraction_ = frac_s
         L *= scale
         S *= scale
+        if self.solution_ is None:
+            self.solution_ = (L, S)                  # same arrays as L_, S_
         M *= scale                                   # our own copy of the input
         M -= L
         M -= S                                       # M now holds the noise
+        if has_miss:
+            M[miss] = np.nan                         # unobserved: no noise estimate
         self.noise_ = M
         self.L_, self.S_, self.rank_ = L, S, rank
         return self
+
+    def _debias(self, M, L, S, cut, mu, fit_rank, miss=None):
+        """Undo the shrinkage of L while keeping Stable PCP's decisions.
+
+        Keep the number of components and the outlier cutoff; refit L as a
+        plain rank-r approximation, treating clear outliers as missing (filled
+        from L itself) so they cannot pull L toward them; then recompute S
+        with the same cutoff. Repeat until the outlier set stops changing.
+        """
+        n = min(M.shape)
+        A = L if L.shape[0] >= L.shape[1] else L.T
+        sv = np.sqrt(np.clip(np.linalg.eigvalsh(A.T @ A), 0, None))[::-1][:n]
+        factor = self.debias_rank_factor
+        if factor is None:
+            # Pure noise has singular values up to about sigma*(sqrt(m)+sqrt(n))
+            # = mu * edge_ratio; after shrinkage by mu at most mu*(edge_ratio-1).
+            # Keep components above that, with a 20% margin. For tall or wide
+            # matrices noise never survives (edge_ratio < 1) and nothing is cut.
+            m_, n_ = M.shape
+            edge_ratio = (np.sqrt(m_) + np.sqrt(n_)) / np.sqrt(2.0 * max(m_, n_))
+            factor = 1.2 * max(0.0, edge_ratio - 1.0)
+        self.debias_rank_factor_ = factor
+        # never more components than the Stable PCP solution itself kept
+        r = min(int(np.sum(sv > factor * mu)), int(fit_rank))
+        if self.max_rank:
+            r = min(r, int(self.max_rank))
+        # Clear outliers (|S| > debias_mask_factor * noise level) are treated
+        # as missing and filled from L; other entries enter with their outlier
+        # part removed (M - S). The noise level is mu / sqrt(2 max(m, n)),
+        # i.e. sigma in the scaled problem, so the rule does not depend on
+        # lam_scale.
+        noise = mu / np.sqrt(2.0 * max(M.shape))
+        k = float(self.debias_mask_factor) * noise / cut
+        Z = np.empty_like(M)
+        support = S != 0
+        for _ in range(int(self.debias_iter)):
+            np.subtract(M, S, out=Z)
+            mask = np.abs(S) > k * cut
+            if miss is not None:
+                mask |= miss
+            np.copyto(Z, L, where=mask)
+            L = _rank_r(Z, r)
+            np.subtract(M, L, out=S)
+            _soft(S, cut, out=S)
+            if miss is not None:
+                np.copyto(S, 0.0, where=miss)
+            new_support = S != 0
+            if np.array_equal(new_support, support):
+                break
+            support = new_support
+        self.debias_rank_ = r
+        return L, S, r
 
     def _check_fitted(self):
         if not hasattr(self, "L_"):

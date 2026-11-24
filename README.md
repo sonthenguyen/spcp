@@ -41,14 +41,7 @@ N = model.noise_              # M - L - S
 L_lean, rank = model.trimmed_low_rank()   # drop noise-level components from L
 ```
 
-`examples/example.py` runs this on synthetic data:
-
-```
-converged in 26 iterations
-rank of L: 5 (after trimming noise components: 3)
-error in L: 2.488%
-outliers found: 973 of 988, false flags: 3180
-```
+`examples/example.py` runs this on synthetic data and prints the results.
 
 ## Choosing the two settings
 
@@ -72,26 +65,26 @@ a sparse decomposition, and `lam_scale` (or `sigma`) is too small.
 
 ## Other options
 
-| Parameter | Default | Purpose |
-|---|---|---|
-| `lam`, `mu` | None | Set λ or the final μ directly instead of `lam_scale`, `sigma` |
-| `svd` | `"auto"` | `"auto"`: fast Gram-matrix method with automatic precision fallback; `"exact"`: LAPACK SVD; `"randomized"`: only helps when L's rank is small relative to the matrix size |
-| `max_rank` | None | Hard cap on the rank of L (heuristic, makes the problem non-convex) |
-| `tol` | 1e-7 | Stopping tolerance, relative to the size of M |
-| `max_iter` | 10000 | Most problems converge well before this limit |
-| `solver` | `"auto"` | `"bcd"`: block-coordinate steps (usually fastest); `"apg"`: accelerated proximal gradient (robust when the dense noise is tiny compared with the outliers); `"auto"`: starts with `"bcd"` and switches to `"apg"` if it is nearly stuck |
-| `continuation`, `eta`, `eta_apg` | True, 0.5, 0.9 | Start with a large μ and shrink it by `eta` (block-coordinate) or `eta_apg` (APG) per step down to the final value |
+The other settings have defaults that rarely need changing. After fitting,
+the results are in `L_`, `S_`, `noise_` and `rank_`.
+[docs/guide.md](docs/guide.md) lists every option and result and describes
+each feature: reading S, trimming L, solvers, checking a fit, debiasing,
+missing values, warm starts and precision.
 
-After fitting: `L_`, `S_`, `noise_`, `rank_`, `n_iter_`, `converged_`,
-`sparse_fraction_`, `switched_at_`, `lam_`, `mu_`. See the docstrings for the
-full list.
+## Future work
 
-## Limitations
+Planned, roughly in this order:
 
-- Missing values (NaN) are not supported yet; fill or remove them first.
-- Each iteration costs one eigen-decomposition of the smaller side of M, so
-  very large matrices in both dimensions are slow. GPU support is planned.
-- Memory use peaks at roughly 5–7 times the size of M.
+- **Prediction intervals** for what the data would have been in chosen cells
+  (a counterfactual).
+- **Automatic noise level**: estimating `sigma` from the data, and an exact
+  fit for data with no dense noise.
+- **A faster solver** for fits that converge slowly.
+- **More cores.** The matrix decomposition in each iteration already uses
+  several cores through NumPy; the element-wise steps still use one.
+- **GPU support**, for matrices that are very large in both dimensions.
+
+Memory use is several times the size of M (see the guide).
 
 ## Running the tests
 

@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.2.0
+Two changes in behaviour:
+- `tol="auto"` is the new default. The fit stops when the remaining error is
+  about 1/5000 of the total noise (sigma * sqrt(m n)), instead of at the fixed
+  1e-7: stricter for precise data (never stricter than 1e-7), looser for noisy
+  data. On synthetic tests this took 13-45% fewer iterations than 0.1.1 and
+  changed L by about 0.0001 sigma. Pass `tol=1e-7` for the old behaviour: with
+  it, results are identical to 0.1.1.
+- NaN entries are now treated as missing values. 0.1.1 raised an error.
+
+New:
+- Missing values. NaN entries in M are unobserved: they are not fitted, L
+  fills them in (its values there are the model's estimate), S is zero there
+  and `noise_` is NaN. `missing_` holds the mask. Needs the block-coordinate
+  solver (`solver="auto"` or `"bcd"`). The noise level mu is not adjusted for
+  the share of missing entries, so mostly-missing data is untested.
+- `debias=True` (off by default): undoes the shrinkage Stable PCP applies to
+  L. The fit keeps its decisions (number of components, which entries are
+  outliers) and L is refitted at full strength, ignoring clear outliers;
+  `debias_rank_` is the rank kept. Options `debias_iter`,
+  `debias_mask_factor`, `debias_rank_factor`. The refit is not part of the
+  convex problem.
+- Warm start: `fit(M, init=model.solution_)` starts from a previous solution
+  (`solution_` is the solver's answer before debiasing). The answer is the
+  same up to the tolerance (the problem is convex), and a refit on nearly the
+  same data takes fewer iterations. A start from very different data can be
+  slower than starting from scratch.
+- `tol_scale` (default 1.0) multiplies the tolerance chosen by `tol="auto"`.
+  Values above 1 give a rougher, faster fit, for fits repeated many times
+  from a warm start; values below 1 solve more precisely. `tol_` is the
+  tolerance used.
+
+Other:
+- Minimum numpy now depends on the Python version (1.23.2 for 3.11, 1.26 for
+  3.12, 2.1 for 3.13, 2.3.2 for 3.14; still 1.21 below 3.11): the first numpy
+  releases with ready-made wheels for each. With an older numpy, pip compiles
+  it, usually without a fast linear-algebra library, and fits run many times
+  slower. pip now reports a version conflict instead.
+- New `docs/guide.md`: short notes on reading S, debiasing, missing values,
+  warm starts and precision. The example reports clear outliers (above three
+  noise levels) separately from the small noise-sized values in S.
+
 ## 0.1.1
 - Lower peak memory: about 5x the size of M (was 7x) with block-coordinate
   steps and 7x (was 11x) with APG. Iterates are updated in place and
